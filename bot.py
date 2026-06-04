@@ -1,7 +1,6 @@
 import os
 import logging
 from flask import Flask, request
-import telegram
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from groq import Groq
@@ -11,12 +10,14 @@ logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]  # 예: https://your-app.onrender.com
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 conversation_history = {}
 
 app = Flask(__name__)
+
+ptb_app = ApplicationBuilder().token(TELEGRAM_TOKEN).updater(None).build()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -37,7 +38,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conversation_history[user_id].append({"role": "user", "content": user_text})
 
-    # 최근 10개 대화만 유지 (메모리 절약)
     if len(conversation_history[user_id]) > 10:
         conversation_history[user_id] = conversation_history[user_id][-10:]
 
@@ -56,23 +56,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(reply)
 
-# Telegram Application 전역 초기화
-ptb_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(CommandHandler("reset", reset))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+async def process_update(update_data):
+    async with ptb_app:
+        update = Update.de_json(update_data, ptb_app.bot)
+        await ptb_app.process_update(update)
+
 @app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), ptb_app.bot)
-    asyncio.run(ptb_app.process_update(update))
+    update_data = request.get_json(force=True)
+    asyncio.run(process_update(update_data))
     return "OK"
 
 @app.route("/set_webhook")
 def set_webhook():
-    url = f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
-    asyncio.run(ptb_app.bot.set_webhook(url))
-    return f"Webhook set to {url}"
+    async def _set():
+        await ptb_app.bot.set_webhook(f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
+    asyncio.run(_set())
+    return f"Webhook set to {WEBHOOK_URL}/{TELEGRAM_TOKEN}"
 
 @app.route("/")
 def index():
