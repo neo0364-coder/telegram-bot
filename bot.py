@@ -1,10 +1,10 @@
 import os
 import logging
+import asyncio
 from flask import Flask, request
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from groq import Groq
-import asyncio
 
 logging.basicConfig(level=logging.INFO)
 
@@ -16,8 +16,6 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 conversation_history = {}
 
 app = Flask(__name__)
-
-ptb_app = ApplicationBuilder().token(TELEGRAM_TOKEN).updater(None).build()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -56,26 +54,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(reply)
 
+# 새 이벤트 루프 방식으로 처리
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+ptb_app = ApplicationBuilder().token(TELEGRAM_TOKEN).updater(None).build()
 ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(CommandHandler("reset", reset))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-async def process_update(update_data):
-    async with ptb_app:
-        update = Update.de_json(update_data, ptb_app.bot)
-        await ptb_app.process_update(update)
-
 @app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     update_data = request.get_json(force=True)
-    asyncio.run(process_update(update_data))
+    async def process():
+        async with ptb_app:
+            update = Update.de_json(update_data, ptb_app.bot)
+            await ptb_app.process_update(update)
+    run_async(process())
     return "OK"
 
 @app.route("/set_webhook")
 def set_webhook():
     async def _set():
-        await ptb_app.bot.set_webhook(f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
-    asyncio.run(_set())
+        bot = Bot(token=TELEGRAM_TOKEN)
+        async with bot:
+            await bot.set_webhook(f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
+    run_async(_set())
     return f"Webhook set to {WEBHOOK_URL}/{TELEGRAM_TOKEN}"
 
 @app.route("/")
@@ -83,5 +92,5 @@ def index():
     return "Bot is running!"
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
