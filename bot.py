@@ -83,7 +83,7 @@ def set_webhook():
     async def _set():
         bot = Bot(token=TELEGRAM_TOKEN)
         async with bot:
-            await bot.set_webhook(f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}")
+            await bot.set_webhook(f"{WEBHOOK_URL}/bot{TELEGRAM_TOKEN}")
     run_async(_set())
     return f"Webhook set to {WEBHOOK_URL}/{TELEGRAM_TOKEN}"
 
