@@ -68,7 +68,7 @@ ptb_app.add_handler(CommandHandler("start", start))
 ptb_app.add_handler(CommandHandler("reset", reset))
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+@app.route(f"/bot{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     update_data = request.get_json(force=True)
     async def process():
