@@ -16,6 +16,8 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 conversation_history = {}
 app = Flask(__name__)
 
+ptb_app = ApplicationBuilder().token(TELEGRAM_TOKEN).updater(None).build()
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversation_history[user_id] = []
@@ -46,7 +48,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = f"오류가 발생했습니다: {str(e)}"
     await update.message.reply_text(reply)
 
-@app.route(f"/bot{os.environ.get('TELEGRAM_TOKEN', '')}", methods=["POST"])
+ptb_app.add_handler(CommandHandler("start", start))
+ptb_app.add_handler(CommandHandler("reset", reset))
+ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+@app.route("/webhook", methods=["POST"])
 def webhook():
     update_data = request.get_json(force=True)
     async def process():
@@ -65,23 +71,18 @@ def webhook():
 def set_webhook():
     async def _set():
         async with Bot(token=TELEGRAM_TOKEN) as bot:
-            await bot.set_webhook(f"{WEBHOOK_URL}/bot{TELEGRAM_TOKEN}")
+            await bot.set_webhook(f"{WEBHOOK_URL}/webhook")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(_set())
     finally:
         loop.close()
-    return f"Webhook set to {WEBHOOK_URL}/bot{TELEGRAM_TOKEN}"
+    return f"Webhook set to {WEBHOOK_URL}/webhook"
 
 @app.route("/")
 def index():
     return "Bot is running!"
-
-ptb_app = ApplicationBuilder().token(TELEGRAM_TOKEN).updater(None).build()
-ptb_app.add_handler(CommandHandler("start", start))
-ptb_app.add_handler(CommandHandler("reset", reset))
-ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
