@@ -7,7 +7,7 @@ from groq import Groq
 
 logging.basicConfig(level=logging.INFO)
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_TOKEN = "8592554948:AAGMv1T0B-cN7BTLXbVK_7LpGcDm-ZAr1sg"
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 
