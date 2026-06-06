@@ -3,14 +3,15 @@ import logging
 import asyncio
 from flask import Flask, request
 from telegram import Update, Bot
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 logging.basicConfig(level=logging.INFO)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 
-genai.configure(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 conversation_history = {}
 app = Flask(__name__)
@@ -37,23 +38,22 @@ async def handle_update(update_data):
         if user_id not in conversation_history:
             conversation_history[user_id] = []
 
-        conversation_history[user_id].append({"role": "user", "parts": [user_text]})
+        conversation_history[user_id].append(types.Content(role="user", parts=[types.Part(text=user_text)]))
 
         if len(conversation_history[user_id]) > 20:
             conversation_history[user_id] = conversation_history[user_id][-20:]
 
         try:
-            model = genai.GenerativeModel(
-                model_name="gemini-2.0-flash",
-                system_instruction="You are a helpful assistant. Respond in the same language the user uses.",
-            )
-            chat = model.start_chat(history=conversation_history[user_id][:-1])
-            response = chat.send_message(
-                user_text,
-                tools=[genai.protos.Tool(google_search=genai.protos.GoogleSearch())]
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=conversation_history[user_id],
+                config=types.GenerateContentConfig(
+                    system_instruction="You are a helpful assistant. Respond in the same language the user uses.",
+                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                )
             )
             reply = response.text
-            conversation_history[user_id].append({"role": "model", "parts": [reply]})
+            conversation_history[user_id].append(types.Content(role="model", parts=[types.Part(text=reply)]))
         except Exception as e:
             reply = f"오류가 발생했습니다: {str(e)}"
 
