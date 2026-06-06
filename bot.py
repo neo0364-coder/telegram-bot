@@ -3,14 +3,15 @@ import logging
 import asyncio
 from flask import Flask, request
 from telegram import Update, Bot
-import anthropic
+import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+
 conversation_history = {}
 app = Flask(__name__)
 
@@ -36,20 +37,21 @@ async def handle_update(update_data):
         if user_id not in conversation_history:
             conversation_history[user_id] = []
 
-        conversation_history[user_id].append({"role": "user", "content": user_text})
+        conversation_history[user_id].append({"role": "user", "parts": [user_text]})
 
         if len(conversation_history[user_id]) > 20:
             conversation_history[user_id] = conversation_history[user_id][-20:]
 
         try:
-            response = anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1024,
-                system="You are a helpful assistant. Respond in the same language the user uses.",
-                messages=conversation_history[user_id],
+            model = genai.GenerativeModel(
+                model_name="gemini-2.0-flash",
+                system_instruction="You are a helpful assistant. Respond in the same language the user uses.",
+                tools="google_search"
             )
-            reply = response.content[0].text
-            conversation_history[user_id].append({"role": "assistant", "content": reply})
+            chat = model.start_chat(history=conversation_history[user_id][:-1])
+            response = chat.send_message(user_text)
+            reply = response.text
+            conversation_history[user_id].append({"role": "model", "parts": [reply]})
         except Exception as e:
             reply = f"오류가 발생했습니다: {str(e)}"
 
