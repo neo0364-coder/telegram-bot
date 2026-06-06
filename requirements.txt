@@ -1,3 +1,4 @@
-google-genai
+groq
+tavily-python
 python-telegram-bot
 flask
