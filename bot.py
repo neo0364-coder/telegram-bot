@@ -3,18 +3,25 @@ import logging
 import asyncio
 from flask import Flask, request
 from telegram import Update, Bot
-from google import genai
-from google.genai import types
+from groq import Groq
+from tavily import TavilyClient
 
 logging.basicConfig(level=logging.INFO)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
 conversation_history = {}
 app = Flask(__name__)
+
+SEARCH_KEYWORDS = ["현재", "지금", "오늘", "최신", "최근", "주가", "날씨", "뉴스", "환율", "가격", "몇시", "누구야", "대통령", "총리", "결과"]
+
+def needs_search(text):
+    return any(keyword in text for keyword in SEARCH_KEYWORDS)
 
 async def handle_update(update_data):
     bot = Bot(token=TELEGRAM_TOKEN)
@@ -38,22 +45,37 @@ async def handle_update(update_data):
         if user_id not in conversation_history:
             conversation_history[user_id] = []
 
-        conversation_history[user_id].append(types.Content(role="user", parts=[types.Part(text=user_text)]))
+        # 검색이 필요한 경우 Tavily로 검색
+        search_context = ""
+        if needs_search(user_text):
+            try:
+                search_result = tavily_client.search(query=user_text, max_results=3)
+                search_context = "\n\n[검색 결과]\n"
+                for r in search_result["results"]:
+                    search_context += f"- {r['title']}: {r['content'][:200]}\n"
+            except Exception as e:
+                logging.error(f"검색 오류: {e}")
+
+        # 검색 결과를 포함해서 질문 구성
+        augmented_text = user_text
+        if search_context:
+            augmented_text = f"{user_text}\n{search_context}"
+
+        conversation_history[user_id].append({"role": "user", "content": augmented_text})
 
         if len(conversation_history[user_id]) > 20:
             conversation_history[user_id] = conversation_history[user_id][-20:]
 
         try:
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=conversation_history[user_id],
-                config=types.GenerateContentConfig(
-                    system_instruction="You are a helpful assistant. Respond in the same language the user uses.",
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                )
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant. Respond in the same language the user uses. If search results are provided, use them to give accurate and up-to-date answers."}
+                ] + conversation_history[user_id],
+                max_tokens=1024,
             )
-            reply = response.text
-            conversation_history[user_id].append(types.Content(role="model", parts=[types.Part(text=reply)]))
+            reply = response.choices[0].message.content
+            conversation_history[user_id].append({"role": "assistant", "content": reply})
         except Exception as e:
             reply = f"오류가 발생했습니다: {str(e)}"
 
