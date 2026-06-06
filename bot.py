@@ -44,10 +44,10 @@ async def handle_update(update_data):
 
         try:
             model = genai.GenerativeModel(
-                model_name="gemini-2.0-flash",
-                system_instruction="You are a helpful assistant. Respond in the same language the user uses.",
-                tools="google_search"
-            )
+    model_name="gemini-2.0-flash",
+    system_instruction="You are a helpful assistant. Respond in the same language the user uses.",
+    tools=[{"google_search": {}}]
+)
             chat = model.start_chat(history=conversation_history[user_id][:-1])
             response = chat.send_message(user_text)
             reply = response.text
