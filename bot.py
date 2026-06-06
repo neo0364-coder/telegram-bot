@@ -3,15 +3,14 @@ import logging
 import asyncio
 from flask import Flask, request
 from telegram import Update, Bot
-from groq import Groq
+import anthropic
 
 logging.basicConfig(level=logging.INFO)
-
-TELEGRAM_TOKEN = "8592554948:AAGMv1T0B-cN7BTLXbVK_7LpGcDm-ZAr1sg"
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 conversation_history = {}
 app = Flask(__name__)
 
@@ -38,16 +37,18 @@ async def handle_update(update_data):
             conversation_history[user_id] = []
 
         conversation_history[user_id].append({"role": "user", "content": user_text})
-        if len(conversation_history[user_id]) > 10:
-            conversation_history[user_id] = conversation_history[user_id][-10:]
+
+        if len(conversation_history[user_id]) > 20:
+            conversation_history[user_id] = conversation_history[user_id][-20:]
 
         try:
-            response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": "You are a helpful assistant. Respond in the same language the user uses."}] + conversation_history[user_id],
+            response = anthropic_client.messages.create(
+                model="claude-sonnet-4-20250514",
                 max_tokens=1024,
+                system="You are a helpful assistant. Respond in the same language the user uses.",
+                messages=conversation_history[user_id],
             )
-            reply = response.choices[0].message.content
+            reply = response.content[0].text
             conversation_history[user_id].append({"role": "assistant", "content": reply})
         except Exception as e:
             reply = f"오류가 발생했습니다: {str(e)}"
