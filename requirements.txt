@@ -2,3 +2,4 @@ groq
 tavily-python
 python-telegram-bot
 flask
+web3
