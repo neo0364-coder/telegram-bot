@@ -3,3 +3,4 @@ tavily-python
 python-telegram-bot
 flask
 web3
+eth-abi
