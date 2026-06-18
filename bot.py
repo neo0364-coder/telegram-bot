@@ -2,6 +2,8 @@ import os
 import logging
 import asyncio
 import random
+import json
+import threading
 from datetime import datetime
 from flask import Flask, request
 from telegram import Update, Bot
@@ -21,34 +23,29 @@ RPC_URL         = os.environ["RPC_URL"]
 BOT_PRIVATE_KEY = os.environ["BOT_PRIVATE_KEY"]
 TOKEN_ADDRESS   = os.environ["TOKEN_ADDRESS"]
 
-# ─── Web3 초기화 (Polygon POA 미들웨어 필수) ──────────────────────
+# ─── Web3 초기화 ──────────────────────────────────────────────────
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
 w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 BOT_WALLET  = w3.eth.account.from_key(BOT_PRIVATE_KEY)
 BOT_ADDRESS = BOT_WALLET.address
 
-# ─── Uniswap V4 UniversalRouter 주소 (Polygon) ────────────────────
+# ─── Uniswap UniversalRouter (Polygon) ────────────────────────────
 UNIVERSAL_ROUTER = "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD"
+WMATIC_ADDRESS   = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
 
-# WMATIC (Polygon 네이티브 래핑 토큰)
-WMATIC_ADDRESS = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
+UNIVERSAL_ROUTER_ABI = json.loads('[{"inputs":[{"internalType":"bytes","name":"commands","type":"bytes"},{"internalType":"bytes[]","name":"inputs","type":"bytes[]"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"execute","outputs":[],"stateMutability":"payable","type":"function"}]')
 
-# ─── UniversalRouter ABI (execute 함수만) ─────────────────────────
-import json
-UNIVERSAL_ROUTER_ABI = json.loads('[{"inputs":[{"internalType":"bytes","name":"commands","type":"bytes"},{"internalType":"bytes[]","name":"inputs","type":"bytes[]"}],"name":"execute","outputs":[],"stateMutability":"payable","type":"function"},{"inputs":[{"internalType":"bytes","name":"commands","type":"bytes"},{"internalType":"bytes[]","name":"inputs","type":"bytes[]"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"execute","outputs":[],"stateMutability":"payable","type":"function"}]')
-
-# ─── ERC20 ABI ────────────────────────────────────────────────────
 ERC20_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"approve","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"spender","type":"address"}],"name":"allowance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]')
 
-# ─── 거래 설정 ────────────────────────────────────────────────────
+# ─── 설정 ─────────────────────────────────────────────────────────
 MIN_POL = 0.5
 MAX_POL = 2.0
 
-# ─── 기타 ─────────────────────────────────────────────────────────
 groq_client          = Groq(api_key=GROQ_API_KEY)
 tavily_client        = TavilyClient(api_key=TAVILY_API_KEY)
 conversation_history = {}
 trading_active       = False
+trading_thread       = None  # ← 핵심: 별도 스레드로 실행
 app                  = Flask(__name__)
 
 SEARCH_KEYWORDS = ["현재", "지금", "오늘", "최신", "최근", "주가", "날씨", "뉴스", "환율", "가격", "몇시", "누구야", "대통령", "총리", "결과"]
@@ -65,8 +62,10 @@ def get_nonce():
 def get_gas_price():
     return int(w3.eth.gas_price * 1.3)
 
+def encode_path(token_in, fee, token_out):
+    return bytes.fromhex(token_in[2:]) + fee.to_bytes(3, 'big') + bytes.fromhex(token_out[2:])
+
 def ensure_approved(token_contract, spender, amount, nonce, gas_price):
-    """approve 필요시 실행, 새 nonce 반환"""
     allowance = token_contract.functions.allowance(BOT_ADDRESS, spender).call()
     if allowance >= amount:
         return nonce
@@ -76,29 +75,16 @@ def ensure_approved(token_contract, spender, amount, nonce, gas_price):
         'from': BOT_ADDRESS, 'gas': 100000,
         'gasPrice': gas_price, 'nonce': nonce,
     })
-    signed = w3.eth.account.sign_transaction(approve_tx, BOT_PRIVATE_KEY)
+    signed  = w3.eth.account.sign_transaction(approve_tx, BOT_PRIVATE_KEY)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
     logging.info(f"Approve 완료: {tx_hash.hex()}")
     return nonce + 1
 
-# ─── V4 encode 헬퍼 ───────────────────────────────────────────────
-def encode_v3_swap_exact_in(recipient, amount_in, amount_out_min, path_bytes, payer_is_user=False):
-    """V4 UniversalRouter용 V3_SWAP_EXACT_IN 인코딩"""
-    from eth_abi import encode
-    return encode(
-        ['address', 'uint256', 'uint256', 'bytes', 'bool'],
-        [recipient, amount_in, amount_out_min, path_bytes, payer_is_user]
-    )
-
-def encode_path_v3(token_in, fee, token_out):
-    """Uniswap V3 path 인코딩 (3바이트 fee)"""
-    fee_bytes = fee.to_bytes(3, 'big')
-    return bytes.fromhex(token_in[2:]) + fee_bytes + bytes.fromhex(token_out[2:])
-
-# ─── 매수 함수 (POL → ELAHZ) ─────────────────────────────────────
+# ─── 매수 (POL → ELAHZ) ──────────────────────────────────────────
 def buy_elahz(pol_amount):
     try:
+        from eth_abi import encode
         router    = w3.eth.contract(address=w3.to_checksum_address(UNIVERSAL_ROUTER), abi=UNIVERSAL_ROUTER_ABI)
         amount_in = w3.to_wei(pol_amount, 'ether')
         deadline  = int(datetime.now().timestamp()) + 300
@@ -108,37 +94,22 @@ def buy_elahz(pol_amount):
         # WRAP_ETH(0x0b) + V3_SWAP_EXACT_IN(0x00)
         commands = bytes([0x0b, 0x00])
 
-        # WRAP_ETH: recipient=router(2), amountMin=amount_in
-        wrap_input = w3.codec.encode(
+        wrap_input = encode(
             ['address', 'uint256'],
             [w3.to_checksum_address(UNIVERSAL_ROUTER), amount_in]
         )
 
-        # path: WMATIC → fee1% → ELAHZ
-        path = encode_path_v3(
-            WMATIC_ADDRESS,
-            10000,  # 1% fee
-            w3.to_checksum_address(TOKEN_ADDRESS)
-        )
-
-        swap_input = encode_v3_swap_exact_in(
-            BOT_ADDRESS,   # recipient
-            amount_in,     # amountIn
-            0,             # amountOutMin
-            path,
-            False          # payer is router (after wrap)
+        path = encode_path(WMATIC_ADDRESS, 10000, w3.to_checksum_address(TOKEN_ADDRESS))
+        swap_input = encode(
+            ['address', 'uint256', 'uint256', 'bytes', 'bool'],
+            [BOT_ADDRESS, amount_in, 0, path, False]
         )
 
         tx = router.functions.execute(
-            commands,
-            [wrap_input, swap_input],
-            deadline
+            commands, [wrap_input, swap_input], deadline
         ).build_transaction({
-            'from':     BOT_ADDRESS,
-            'value':    amount_in,
-            'gas':      400000,
-            'gasPrice': gas_price,
-            'nonce':    nonce,
+            'from': BOT_ADDRESS, 'value': amount_in,
+            'gas': 400000, 'gasPrice': gas_price, 'nonce': nonce,
         })
 
         signed  = w3.eth.account.sign_transaction(tx, BOT_PRIVATE_KEY)
@@ -150,9 +121,10 @@ def buy_elahz(pol_amount):
         logging.error(f"매수 오류: {e}")
         return None, 0
 
-# ─── 매도 함수 (ELAHZ → POL) ─────────────────────────────────────
+# ─── 매도 (ELAHZ → POL) ──────────────────────────────────────────
 def sell_elahz():
     try:
+        from eth_abi import encode
         token     = w3.eth.contract(address=w3.to_checksum_address(TOKEN_ADDRESS), abi=ERC20_ABI)
         router    = w3.eth.contract(address=w3.to_checksum_address(UNIVERSAL_ROUTER), abi=UNIVERSAL_ROUTER_ABI)
         gas_price = get_gas_price()
@@ -166,47 +138,30 @@ def sell_elahz():
         nonce    = get_nonce()
         deadline = int(datetime.now().timestamp()) + 300
 
-        # Approve
         nonce = ensure_approved(
-            token,
-            w3.to_checksum_address(UNIVERSAL_ROUTER),
+            token, w3.to_checksum_address(UNIVERSAL_ROUTER),
             amount_in, nonce, gas_price
         )
 
         # V3_SWAP_EXACT_IN(0x00) + UNWRAP_WETH(0x0c)
         commands = bytes([0x00, 0x0c])
 
-        # path: ELAHZ → fee1% → WMATIC
-        path = encode_path_v3(
-            w3.to_checksum_address(TOKEN_ADDRESS),
-            10000,
-            WMATIC_ADDRESS
+        path = encode_path(w3.to_checksum_address(TOKEN_ADDRESS), 10000, WMATIC_ADDRESS)
+        swap_input = encode(
+            ['address', 'uint256', 'uint256', 'bytes', 'bool'],
+            [w3.to_checksum_address(UNIVERSAL_ROUTER), amount_in, 0, path, False]
         )
 
-        swap_input = encode_v3_swap_exact_in(
-            w3.to_checksum_address(UNIVERSAL_ROUTER),  # recipient=router (unwrap 전)
-            amount_in,
-            0,
-            path,
-            False
-        )
-
-        # UNWRAP_WETH: recipient=BOT, amountMin=0
-        unwrap_input = w3.codec.encode(
+        unwrap_input = encode(
             ['address', 'uint256'],
             [BOT_ADDRESS, 0]
         )
 
         tx = router.functions.execute(
-            commands,
-            [swap_input, unwrap_input],
-            deadline
+            commands, [swap_input, unwrap_input], deadline
         ).build_transaction({
-            'from':     BOT_ADDRESS,
-            'value':    0,
-            'gas':      400000,
-            'gasPrice': gas_price,
-            'nonce':    nonce,
+            'from': BOT_ADDRESS, 'value': 0,
+            'gas': 400000, 'gasPrice': gas_price, 'nonce': nonce,
         })
 
         signed  = w3.eth.account.sign_transaction(tx, BOT_PRIVATE_KEY)
@@ -218,56 +173,64 @@ def sell_elahz():
         logging.error(f"매도 오류: {e}")
         return None, 0
 
-# ─── 자동거래 루프 ────────────────────────────────────────────────
-async def auto_trade(bot, chat_id):
+# ─── 자동거래 루프 (별도 스레드에서 실행) ────────────────────────
+def trading_loop(chat_id):
+    """Flask와 독립된 스레드에서 실행"""
     global trading_active
-    await bot.send_message(chat_id=chat_id, text="🤖 자동거래 루프 시작!")
 
-    while trading_active:
-        try:
-            pol_amount = get_random_pol_amount()
+    async def _run():
+        async with Bot(token=TELEGRAM_TOKEN) as bot:
+            await bot.send_message(chat_id=chat_id, text="🤖 자동거래 루프 시작!")
+            while trading_active:
+                try:
+                    pol_amount = get_random_pol_amount()
 
-            # 매수
-            await bot.send_message(chat_id=chat_id, text=f"🔄 매수 시도 중... {pol_amount} POL")
-            await asyncio.sleep(random.randint(1, 5))
-            tx_hash, status = await asyncio.get_event_loop().run_in_executor(None, buy_elahz, pol_amount)
-            if status == 1:
-                await bot.send_message(chat_id=chat_id, text=f"✅ 매수 완료\nPOL: {pol_amount}\nhttps://polygonscan.com/tx/{tx_hash}")
-            else:
-                await bot.send_message(chat_id=chat_id, text=f"❌ 매수 실패 TX: {tx_hash}")
+                    # 매수
+                    await bot.send_message(chat_id=chat_id, text=f"🔄 매수 시도 중... {pol_amount} POL")
+                    await asyncio.sleep(random.randint(1, 5))
+                    tx_hash, status = await asyncio.get_event_loop().run_in_executor(None, buy_elahz, pol_amount)
+                    if status == 1:
+                        await bot.send_message(chat_id=chat_id, text=f"✅ 매수 완료\nPOL: {pol_amount}\nhttps://polygonscan.com/tx/{tx_hash}")
+                    else:
+                        await bot.send_message(chat_id=chat_id, text=f"❌ 매수 실패\nTX: {tx_hash}")
 
-            # 매수 후 대기 (25~35분)
-            wait = random.randint(1500, 2100)
-            await bot.send_message(chat_id=chat_id, text=f"⏳ {wait//60}분 후 매도 예정")
-            await asyncio.sleep(wait)
+                    # 매수 후 대기 25~35분
+                    wait = random.randint(1500, 2100)
+                    await bot.send_message(chat_id=chat_id, text=f"⏳ {wait//60}분 후 매도 예정")
+                    await asyncio.sleep(wait)
 
-            if not trading_active:
-                break
+                    if not trading_active:
+                        break
 
-            # 매도
-            await bot.send_message(chat_id=chat_id, text="🔄 매도 시도 중...")
-            await asyncio.sleep(random.randint(1, 5))
-            tx_hash, status = await asyncio.get_event_loop().run_in_executor(None, sell_elahz)
-            if status == 1:
-                await bot.send_message(chat_id=chat_id, text=f"✅ 매도 완료\nhttps://polygonscan.com/tx/{tx_hash}")
-            else:
-                await bot.send_message(chat_id=chat_id, text=f"❌ 매도 실패 TX: {tx_hash}")
+                    # 매도
+                    await bot.send_message(chat_id=chat_id, text="🔄 매도 시도 중...")
+                    await asyncio.sleep(random.randint(1, 5))
+                    tx_hash, status = await asyncio.get_event_loop().run_in_executor(None, sell_elahz)
+                    if status == 1:
+                        await bot.send_message(chat_id=chat_id, text=f"✅ 매도 완료\nhttps://polygonscan.com/tx/{tx_hash}")
+                    else:
+                        await bot.send_message(chat_id=chat_id, text=f"❌ 매도 실패\nTX: {tx_hash}")
 
-            # 다음 거래까지 대기 (25~35분)
-            wait = random.randint(1500, 2100)
-            await bot.send_message(chat_id=chat_id, text=f"⏳ {wait//60}분 후 다음 거래 예정")
-            await asyncio.sleep(wait)
+                    # 다음 거래까지 대기 25~35분
+                    wait = random.randint(1500, 2100)
+                    await bot.send_message(chat_id=chat_id, text=f"⏳ {wait//60}분 후 다음 거래 예정")
+                    await asyncio.sleep(wait)
 
-        except Exception as e:
-            logging.error(f"자동거래 오류: {e}")
-            await bot.send_message(chat_id=chat_id, text=f"⚠️ 오류: {str(e)}\n60초 후 재시도")
-            await asyncio.sleep(60)
+                except Exception as e:
+                    logging.error(f"자동거래 오류: {e}")
+                    try:
+                        await bot.send_message(chat_id=chat_id, text=f"⚠️ 오류: {str(e)}\n60초 후 재시도")
+                    except:
+                        pass
+                    await asyncio.sleep(60)
 
-    await bot.send_message(chat_id=chat_id, text="⛔ 자동거래 루프 종료")
+            await bot.send_message(chat_id=chat_id, text="⛔ 자동거래 루프 종료")
+
+    asyncio.run(_run())
 
 # ─── 텔레그램 핸들러 ──────────────────────────────────────────────
 async def handle_update(update_data):
-    global trading_active
+    global trading_active, trading_thread
     bot = Bot(token=TELEGRAM_TOKEN)
     async with bot:
         update    = Update.de_json(update_data, bot)
@@ -299,7 +262,12 @@ async def handle_update(update_data):
                 await bot.send_message(chat_id=chat_id, text="이미 자동거래가 실행 중입니다!")
                 return
             trading_active = True
-            asyncio.create_task(auto_trade(bot, chat_id))
+            # ← 핵심: threading으로 Flask와 독립 실행
+            trading_thread = threading.Thread(
+                target=trading_loop, args=(chat_id,), daemon=True
+            )
+            trading_thread.start()
+            await bot.send_message(chat_id=chat_id, text="✅ 자동거래 시작!")
             return
 
         if user_text == "/stoptrading":
@@ -309,11 +277,11 @@ async def handle_update(update_data):
 
         if user_text == "/balance":
             try:
-                pol_balance   = w3.eth.get_balance(BOT_ADDRESS)
-                pol           = w3.from_wei(pol_balance, 'ether')
-                token         = w3.eth.contract(address=w3.to_checksum_address(TOKEN_ADDRESS), abi=ERC20_ABI)
-                elahz_balance = token.functions.balanceOf(BOT_ADDRESS).call()
-                elahz         = elahz_balance / 10**18
+                pol_bal   = w3.eth.get_balance(BOT_ADDRESS)
+                pol       = w3.from_wei(pol_bal, 'ether')
+                token     = w3.eth.contract(address=w3.to_checksum_address(TOKEN_ADDRESS), abi=ERC20_ABI)
+                elahz_bal = token.functions.balanceOf(BOT_ADDRESS).call()
+                elahz     = elahz_bal / 10**18
                 await bot.send_message(chat_id=chat_id, text=f"💰 봇 지갑 잔액\nPOL: {pol:.6f}\nELAHZ: {elahz:.4f}")
             except Exception as e:
                 await bot.send_message(chat_id=chat_id, text=f"잔액 조회 오류: {str(e)}")
