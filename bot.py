@@ -6,7 +6,6 @@ import json
 import threading
 import time
 import base64
-import struct
 from datetime import datetime
 from flask import Flask, request
 from telegram import Update, Bot
@@ -28,15 +27,10 @@ GROQ_API_KEY    = os.environ["GROQ_API_KEY"]
 WEBHOOK_URL     = os.environ["WEBHOOK_URL"]
 TAVILY_API_KEY  = os.environ["TAVILY_API_KEY"]
 
-# Solana RPC (Helius 또는 다른 RPC URL)
 RPC_URL         = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
-
-BOT_PRIVATE_KEY = os.environ["BOT_PRIVATE_KEY2"]   # base58 또는 JSON 배열
-
-# ELAZ 토큰 Mint 주소
+BOT_PRIVATE_KEY = os.environ["BOT_PRIVATE_KEY2"]
 TOKEN_MINT      = os.environ.get("TOKEN_MINT", "GNEuYzCanJP7rj4BB1VGh53JWhWkbeKVYDpzNzsg4hyh")
 
-# 추가 지갑 (WALLET_1_KEY ~ WALLET_10_KEY)
 EXTRA_WALLET_KEYS = []
 for i in range(1, 11):
     key = os.environ.get(f"WALLET_{i}_KEY")
@@ -46,19 +40,33 @@ for i in range(1, 11):
 LARGE_WALLET_INDEX      = 5
 LARGE_WALLET_MULTIPLIER = 3.0
 
-# ─── Raydium / Jupiter 관련 주소 ──────────────────────────────────
-WSOL_MINT = "So11111111111111111111111111111111111111112"
-
-# Jupiter Aggregator API (Raydium CPMM 풀 포함 자동 라우팅)
-JUPITER_QUOTE_API = "https://jupiter-swap-api.quiknode.pro/v6/quote"
-JUPITER_SWAP_API  = "https://jupiter-swap-api.quiknode.pro/v6/swap"
+# ─── Jupiter 공개 API (QuickNode 불필요) ──────────────────────────
+WSOL_MINT         = "So11111111111111111111111111111111111111112"
+JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"   # ✅ 수정
+JUPITER_SWAP_API  = "https://quote-api.jup.ag/v6/swap"    # ✅ 수정
 
 # ─── 안전 설정 ────────────────────────────────────────────────────
-MIN_SOL             = 0.01    # 최소 매수 SOL (기존 MIN_POL 0.3 → SOL 단가 고려해 0.01)
-MAX_SOL             = 0.05    # 최대 매수 SOL (기존 MAX_POL 1.0 → 0.05)
-MAX_SELL_PCT        = 8       # 보유량의 최대 8% 매도
-SLIPPAGE_BPS        = 300     # 3% 슬리피지 (300 bps)
-PRIORITY_FEE_MICRO  = 200000  # 우선순위 수수료 (micro-lamports)
+MIN_SOL            = 0.01
+MAX_SOL            = 0.05
+MAX_SELL_PCT       = 8
+SLIPPAGE_BPS       = 300
+PRIORITY_FEE_MICRO = 200000
+
+# ─── 스레드 안전 상태 관리 ✅ ────────────────────────────────────
+_state_lock    = threading.Lock()
+trading_active = False
+trading_threads = []
+daily_log      = []
+conversation_history = {}
+
+def set_trading(val: bool):
+    global trading_active
+    with _state_lock:
+        trading_active = val
+
+def is_trading() -> bool:
+    with _state_lock:
+        return trading_active
 
 # ─── 키 파싱 유틸 ─────────────────────────────────────────────────
 def parse_keypair(raw: str) -> Keypair:
@@ -69,20 +77,15 @@ def parse_keypair(raw: str) -> Keypair:
         arr = json.loads(raw)
         return Keypair.from_bytes(bytes(arr))
     else:
-        from solders.keypair import Keypair as KP
-        return KP.from_base58_string(raw)
+        return Keypair.from_base58_string(raw)
 
 # ─── 봇/지갑 초기화 ───────────────────────────────────────────────
 BOT_KEYPAIR = parse_keypair(BOT_PRIVATE_KEY)
 BOT_ADDRESS = str(BOT_KEYPAIR.pubkey())
 
-groq_client          = Groq(api_key=GROQ_API_KEY)
-tavily_client        = TavilyClient(api_key=TAVILY_API_KEY)
-conversation_history = {}
-trading_active       = False
-trading_threads      = []
-daily_log            = []
-app                  = Flask(__name__)
+groq_client   = Groq(api_key=GROQ_API_KEY)
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+app           = Flask(__name__)
 
 SEARCH_KEYWORDS = ["현재","지금","오늘","최신","최근","주가","날씨","뉴스","환율","가격","몇시","누구야","대통령","총리","결과"]
 
@@ -103,12 +106,10 @@ def rpc_post(method: str, params: list):
     return data["result"]
 
 def get_sol_balance(pubkey: str) -> float:
-    """SOL 잔액 조회 (SOL 단위)"""
     result = rpc_post("getBalance", [pubkey, {"commitment": "confirmed"}])
     return result["value"] / 1e9
 
 def get_token_balance(pubkey: str, mint: str) -> int:
-    """SPL 토큰 잔액 조회 (raw amount, lamports 단위)"""
     result = rpc_post("getTokenAccountsByOwner", [
         pubkey,
         {"mint": mint},
@@ -120,10 +121,6 @@ def get_token_balance(pubkey: str, mint: str) -> int:
     info = accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]
     return int(info["amount"])
 
-def get_token_decimals(mint: str) -> int:
-    result = rpc_post("getAccountInfo", [mint, {"encoding": "jsonParsed"}])
-    return result["value"]["data"]["parsed"]["info"]["decimals"]
-
 def get_latest_blockhash() -> str:
     result = rpc_post("getLatestBlockhash", [{"commitment": "finalized"}])
     return result["value"]["blockhash"]
@@ -133,7 +130,7 @@ def send_transaction(signed_tx_b64: str) -> str:
         signed_tx_b64,
         {"encoding": "base64", "preflightCommitment": "confirmed", "skipPreflight": False}
     ])
-    return result  # tx signature
+    return result
 
 def confirm_transaction(sig: str, timeout: int = 60) -> bool:
     deadline = time.time() + timeout
@@ -152,48 +149,63 @@ def confirm_transaction(sig: str, timeout: int = 60) -> bool:
 # ─── Jupiter 스왑 ─────────────────────────────────────────────────
 def jupiter_quote(input_mint: str, output_mint: str, amount_lamports: int) -> dict:
     resp = httpx.get(JUPITER_QUOTE_API, params={
-        "inputMint":         input_mint,
-        "outputMint":        output_mint,
-        "amount":            amount_lamports,
-        "slippageBps":       SLIPPAGE_BPS,
-        "onlyDirectRoutes":  False,
+        "inputMint":           input_mint,
+        "outputMint":          output_mint,
+        "amount":              amount_lamports,
+        "slippageBps":         SLIPPAGE_BPS,
+        "onlyDirectRoutes":    False,
         "asLegacyTransaction": False,
     }, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
 def jupiter_swap_tx(quote: dict, user_pubkey: str) -> str:
-    """Jupiter에서 서명 전 트랜잭션 직렬화(base64) 반환"""
     resp = httpx.post(JUPITER_SWAP_API, json={
-        "quoteResponse":              quote,
-        "userPublicKey":              user_pubkey,
-        "wrapAndUnwrapSol":           True,
-        "prioritizationFeeLamports":  PRIORITY_FEE_MICRO,
-        "dynamicComputeUnitLimit":    True,
+        "quoteResponse":             quote,
+        "userPublicKey":             user_pubkey,
+        "wrapAndUnwrapSol":          True,
+        "prioritizationFeeLamports": PRIORITY_FEE_MICRO,
+        "dynamicComputeUnitLimit":   True,
     }, timeout=15)
     resp.raise_for_status()
     return resp.json()["swapTransaction"]
 
 def sign_and_send(tx_b64: str, keypair: Keypair) -> tuple[str, bool]:
-    """트랜잭션 서명 후 전송, (signature, success) 반환"""
+    """트랜잭션 서명 후 전송 - 기존 서명 슬롯 유지 ✅"""
     raw = base64.b64decode(tx_b64)
     tx  = VersionedTransaction.from_bytes(raw)
+
     msg_bytes = to_bytes_versioned(tx.message)
-    sig = keypair.sign_message(msg_bytes)
-    signed = VersionedTransaction.populate(tx.message, [sig])
+    my_sig    = keypair.sign_message(msg_bytes)
+
+    # 기존 서명 목록에서 내 pubkey 위치만 교체
+    sigs         = list(tx.signatures)
+    account_keys = tx.message.account_keys
+    my_pubkey    = keypair.pubkey()
+    for i, key in enumerate(account_keys):
+        if str(key) == str(my_pubkey) and i < len(sigs):
+            sigs[i] = my_sig
+            break
+    else:
+        # 위치를 못 찾으면 0번 슬롯에 삽입
+        if sigs:
+            sigs[0] = my_sig
+        else:
+            sigs = [my_sig]
+
+    signed     = VersionedTransaction.populate(tx.message, sigs)
     signed_b64 = base64.b64encode(bytes(signed)).decode()
-    tx_sig = send_transaction(signed_b64)
-    ok = confirm_transaction(tx_sig)
+    tx_sig     = send_transaction(signed_b64)
+    ok         = confirm_transaction(tx_sig)
     return tx_sig, ok
 
 # ─── 매수 (SOL → ELAZ) ────────────────────────────────────────────
 def buy_elaz(keypair: Keypair, multiplier: float = 1.0):
     try:
-        pubkey = str(keypair.pubkey())
+        pubkey     = str(keypair.pubkey())
         sol_amount = random.uniform(MIN_SOL, MAX_SOL) * multiplier
         lamports   = int(sol_amount * 1e9)
 
-        # SOL 잔액 확인 (수수료 포함 여유 체크)
         sol_bal = get_sol_balance(pubkey)
         if sol_bal < sol_amount + 0.005:
             return None, False, f"SOL 잔액 부족 ({sol_bal:.4f})"
@@ -215,9 +227,9 @@ def sell_elaz(keypair: Keypair, multiplier: float = 1.0):
         if balance == 0:
             return None, False, "ELAZ 잔액없음"
 
-        pct        = random.uniform(2, MAX_SELL_PCT) / 100 * multiplier
-        pct        = min(pct, 0.95)
-        amount_in  = int(balance * pct)
+        pct       = random.uniform(2, MAX_SELL_PCT) / 100 * multiplier
+        pct       = min(pct, 0.95)
+        amount_in = int(balance * pct)
         if amount_in == 0:
             return None, False, "매도량 0"
 
@@ -225,7 +237,7 @@ def sell_elaz(keypair: Keypair, multiplier: float = 1.0):
         tx_b64 = jupiter_swap_tx(quote, pubkey)
         sig, ok = sign_and_send(tx_b64, keypair)
 
-        decimals = 6  # ELAZ 소수점 (필요시 get_token_decimals(TOKEN_MINT) 호출)
+        decimals = 6
         readable = amount_in / (10 ** decimals)
         return sig, ok, f"{readable:.2f} ELAZ"
 
@@ -236,35 +248,37 @@ def sell_elaz(keypair: Keypair, multiplier: float = 1.0):
 # ─── 지갑별 자동거래 루프 ─────────────────────────────────────────
 def wallet_trading_loop(keypair: Keypair, min_wait_sec: int, max_wait_sec: int,
                         wallet_label: str, multiplier: float = 1.0):
-    global trading_active
-    time.sleep(random.randint(0, 600))  # 지갑마다 랜덤 시작 딜레이
+    time.sleep(random.randint(0, 600))
 
-    while trading_active:
+    while is_trading():  # ✅ 스레드 안전 체크
         try:
             # ── 매수 ──
             sig, ok, info = buy_elaz(keypair, multiplier)
-            ts = datetime.now().strftime("%H:%M")
+            ts  = datetime.now().strftime("%H:%M")
             tag = "✅" if ok else "❌"
-            daily_log.append(f"{tag} [{wallet_label}/Raydium] {ts} 매수 {info}")
+            daily_log.append(f"{tag} [{wallet_label}] {ts} 매수 {info}")
             if sig:
                 daily_log.append(f"   └ https://solscan.io/tx/{sig}")
 
             wait = random.randint(min_wait_sec, max_wait_sec)
-            time.sleep(wait)
-
-            if not trading_active:
-                break
+            for _ in range(wait):
+                if not is_trading():
+                    return
+                time.sleep(1)
 
             # ── 매도 ──
             sig, ok, info = sell_elaz(keypair, multiplier)
-            ts = datetime.now().strftime("%H:%M")
+            ts  = datetime.now().strftime("%H:%M")
             tag = "✅" if ok else "❌"
-            daily_log.append(f"{tag} [{wallet_label}/Raydium] {ts} 매도 {info}")
+            daily_log.append(f"{tag} [{wallet_label}] {ts} 매도 {info}")
             if sig:
                 daily_log.append(f"   └ https://solscan.io/tx/{sig}")
 
             wait = random.randint(min_wait_sec, max_wait_sec)
-            time.sleep(wait)
+            for _ in range(wait):
+                if not is_trading():
+                    return
+                time.sleep(1)
 
         except Exception as e:
             logging.error(f"{wallet_label} 루프 오류: {e}")
@@ -281,16 +295,22 @@ def daily_report_loop(chat_id):
             await bot.send_message(chat_id=chat_id, text=msg[:4000])
             daily_log.clear()
 
-    while trading_active:
-        now = datetime.now()
+    while is_trading():
+        now          = datetime.now()
         target_hours = [9, 21]
-        next_hour = min([h for h in target_hours if h > now.hour], default=None)
+        next_hour    = next((h for h in target_hours if h > now.hour), None)
         if next_hour:
             wait = (next_hour - now.hour) * 3600 - now.minute * 60
         else:
             wait = (24 - now.hour + target_hours[0]) * 3600 - now.minute * 60
         wait = max(wait, 60)
-        time.sleep(min(wait, 3600))
+
+        # 1초씩 쪼개서 trading 중지 시 빠르게 탈출
+        for _ in range(min(wait, 3600)):
+            if not is_trading():
+                return
+            time.sleep(1)
+
         now2 = datetime.now()
         if now2.hour in target_hours and now2.minute < 5:
             asyncio.run(send_report())
@@ -298,16 +318,17 @@ def daily_report_loop(chat_id):
 
 # ─── 텔레그램 핸들러 ──────────────────────────────────────────────
 async def handle_update(update_data):
-    global trading_active, trading_threads
+    global trading_threads
     bot = Bot(token=TELEGRAM_TOKEN)
     async with bot:
-        update    = Update.de_json(update_data, bot)
+        update = Update.de_json(update_data, bot)
         if not update.message or not update.message.text:
             return
         user_id   = update.effective_user.id
         chat_id   = update.message.chat_id
         user_text = update.message.text
 
+        # ── /start ──
         if user_text == "/start":
             conversation_history[user_id] = []
             await bot.send_message(chat_id=chat_id, text=(
@@ -321,11 +342,13 @@ async def handle_update(update_data):
             ))
             return
 
+        # ── /reset ──
         if user_text == "/reset":
             conversation_history[user_id] = []
             await bot.send_message(chat_id=chat_id, text="대화 기록이 초기화되었습니다.")
             return
 
+        # ── /report ──
         if user_text == "/report":
             if not daily_log:
                 await bot.send_message(chat_id=chat_id, text="아직 거래 내역이 없습니다.")
@@ -334,14 +357,16 @@ async def handle_update(update_data):
                 await bot.send_message(chat_id=chat_id, text=msg[:4000])
             return
 
+        # ── /starttrading ──
         if user_text == "/starttrading":
-            if trading_active:
+            if is_trading():
                 await bot.send_message(chat_id=chat_id, text="이미 자동거래가 실행 중입니다!")
                 return
-            trading_active = True
+
+            set_trading(True)
             trading_threads = []
 
-            # 메인 지갑: 하루 약 12회 (25~35분 간격)
+            # 메인 지갑: 하루 ~12회 (25~35분 간격)
             t1 = threading.Thread(
                 target=wallet_trading_loop,
                 args=(BOT_KEYPAIR, 1500, 2100, "메인"),
@@ -352,8 +377,8 @@ async def handle_update(update_data):
 
             # 추가 지갑: 하루 5~6회 (2~4.5시간 간격)
             for idx, key in EXTRA_WALLET_KEYS:
-                kp   = parse_keypair(key)
-                mult = LARGE_WALLET_MULTIPLIER if idx == LARGE_WALLET_INDEX else 1.0
+                kp    = parse_keypair(key)
+                mult  = LARGE_WALLET_MULTIPLIER if idx == LARGE_WALLET_INDEX else 1.0
                 label = f"지갑{idx}" + (" (대형)" if mult > 1.0 else "")
                 t = threading.Thread(
                     target=wallet_trading_loop,
@@ -381,11 +406,13 @@ async def handle_update(update_data):
             )
             return
 
+        # ── /stoptrading ──
         if user_text == "/stoptrading":
-            trading_active = False
+            set_trading(False)
             await bot.send_message(chat_id=chat_id, text="⛔ 자동거래 중지되었습니다.")
             return
 
+        # ── /balance ──
         if user_text == "/balance":
             try:
                 msg = f"💰 지갑 잔액\n\n메인 ({BOT_ADDRESS[:8]}...)\n"
@@ -440,10 +467,21 @@ async def handle_update(update_data):
 
         await bot.send_message(chat_id=chat_id, text=reply)
 
-# ─── Flask ────────────────────────────────────────────────────────
+# ─── Flask webhook: asyncio.run() 스레드 분리 ✅ ──────────────────
+def _run_in_thread(data):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(handle_update(data))
+    finally:
+        loop.close()
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    asyncio.run(handle_update(request.get_json(force=True)))
+    data = request.get_json(force=True)
+    t = threading.Thread(target=_run_in_thread, args=(data,), daemon=True)
+    t.start()
+    t.join(timeout=25)
     return "OK"
 
 @app.route("/set_webhook")
