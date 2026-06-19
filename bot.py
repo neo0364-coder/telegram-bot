@@ -42,8 +42,8 @@ LARGE_WALLET_MULTIPLIER = 3.0
 
 # ─── Jupiter 공개 API ─────────────────────────────────────────────
 WSOL_MINT         = "So11111111111111111111111111111111111111112"
-JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_API  = "https://quote-api.jup.ag/v6/swap"
+JUPITER_QUOTE_API = "https://lite-api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_API  = "https://lite-api.jup.ag/swap/v1/swap"
 
 # ─── 안전 설정 ────────────────────────────────────────────────────
 MIN_SOL            = 0.01
