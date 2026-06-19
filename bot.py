@@ -488,7 +488,7 @@ def webhook():
     data = request.get_json(force=True)
     t = threading.Thread(target=_run_in_thread, args=(data,), daemon=True)
     t.start()
-    t.join(timeout=25)
+    
     return "OK"
 
 @app.route("/set_webhook")
