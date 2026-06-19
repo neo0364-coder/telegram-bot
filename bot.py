@@ -50,8 +50,8 @@ LARGE_WALLET_MULTIPLIER = 3.0
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 # Jupiter Aggregator API (Raydium CPMM 풀 포함 자동 라우팅)
-JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_API  = "https://quote-api.jup.ag/v6/swap"
+JUPITER_QUOTE_API = "https://jupiter-swap-api.quiknode.pro/v6/quote"
+JUPITER_SWAP_API  = "https://jupiter-swap-api.quiknode.pro/v6/swap"
 
 # ─── 안전 설정 ────────────────────────────────────────────────────
 MIN_SOL             = 0.01    # 최소 매수 SOL (기존 MIN_POL 0.3 → SOL 단가 고려해 0.01)
