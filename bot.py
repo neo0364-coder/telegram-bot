@@ -31,7 +31,7 @@ TAVILY_API_KEY  = os.environ["TAVILY_API_KEY"]
 # Solana RPC (Helius 또는 다른 RPC URL)
 RPC_URL         = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
 
-BOT_PRIVATE_KEY = os.environ["BOT_PRIVATE_KEY"]   # base58 또는 JSON 배열
+BOT_PRIVATE_KEY = os.environ["BOT_PRIVATE_KEY2"]   # base58 또는 JSON 배열
 
 # ELAZ 토큰 Mint 주소
 TOKEN_MINT      = os.environ.get("TOKEN_MINT", "GNEuYzCanJP7rj4BB1VGh53JWhWkbeKVYDpzNzsg4hyh")
