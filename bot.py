@@ -62,16 +62,13 @@ PRIORITY_FEE_MICRO  = 200000  # 우선순위 수수료 (micro-lamports)
 
 # ─── 키 파싱 유틸 ─────────────────────────────────────────────────
 def parse_keypair(raw: str) -> Keypair:
-    """
-    base58 문자열 또는 JSON 숫자 배열([12,34,...]) 형태 모두 지원
-    """
-    raw = raw.strip()
+    raw = raw.strip().strip('"').strip("'")
+    if raw.startswith("0x") or raw.startswith("0X"):
+        raw = raw[2:]
     if raw.startswith("["):
-        # JSON 배열 형태: [12, 34, 56, ...]
         arr = json.loads(raw)
         return Keypair.from_bytes(bytes(arr))
     else:
-        # base58 형태
         from solders.keypair import Keypair as KP
         return KP.from_base58_string(raw)
 
