@@ -40,10 +40,10 @@ for i in range(1, 11):
 LARGE_WALLET_INDEX      = 5
 LARGE_WALLET_MULTIPLIER = 3.0
 
-# ─── Jupiter 공개 API (QuickNode 불필요) ──────────────────────────
+# ─── Jupiter 공개 API ─────────────────────────────────────────────
 WSOL_MINT         = "So11111111111111111111111111111111111111112"
-JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"   # ✅ 수정
-JUPITER_SWAP_API  = "https://quote-api.jup.ag/v6/swap"    # ✅ 수정
+JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
+JUPITER_SWAP_API  = "https://quote-api.jup.ag/v6/swap"
 
 # ─── 안전 설정 ────────────────────────────────────────────────────
 MIN_SOL            = 0.01
@@ -52,11 +52,11 @@ MAX_SELL_PCT       = 8
 SLIPPAGE_BPS       = 300
 PRIORITY_FEE_MICRO = 200000
 
-# ─── 스레드 안전 상태 관리 ✅ ────────────────────────────────────
-_state_lock    = threading.Lock()
-trading_active = False
-trading_threads = []
-daily_log      = []
+# ─── 스레드 안전 상태 관리 ────────────────────────────────────────
+_state_lock      = threading.Lock()
+trading_active   = False
+trading_threads  = []
+daily_log        = []
 conversation_history = {}
 
 def set_trading(val: bool):
@@ -146,16 +146,17 @@ def confirm_transaction(sig: str, timeout: int = 60) -> bool:
         time.sleep(2)
     return False
 
-# ─── Jupiter 스왑 ─────────────────────────────────────────────────
+# ─── Jupiter 스왑 (bool 버그 수정) ───────────────────────────────
 def jupiter_quote(input_mint: str, output_mint: str, amount_lamports: int) -> dict:
     resp = httpx.get(JUPITER_QUOTE_API, params={
         "inputMint":           input_mint,
         "outputMint":          output_mint,
         "amount":              amount_lamports,
         "slippageBps":         SLIPPAGE_BPS,
-        "onlyDirectRoutes":    False,
-        "asLegacyTransaction": False,
+        "onlyDirectRoutes":    "false",   # ✅ 수정: Python bool → 소문자 문자열
+        "asLegacyTransaction": "false",   # ✅ 수정: Python bool → 소문자 문자열
     }, timeout=15)
+    logging.info(f"Jupiter quote 응답: {resp.status_code} {resp.text[:300]}")
     resp.raise_for_status()
     return resp.json()
 
@@ -167,18 +168,17 @@ def jupiter_swap_tx(quote: dict, user_pubkey: str) -> str:
         "prioritizationFeeLamports": PRIORITY_FEE_MICRO,
         "dynamicComputeUnitLimit":   True,
     }, timeout=15)
+    logging.info(f"Jupiter swap 응답: {resp.status_code} {resp.text[:300]}")
     resp.raise_for_status()
     return resp.json()["swapTransaction"]
 
 def sign_and_send(tx_b64: str, keypair: Keypair) -> tuple[str, bool]:
-    """트랜잭션 서명 후 전송 - 기존 서명 슬롯 유지 ✅"""
     raw = base64.b64decode(tx_b64)
     tx  = VersionedTransaction.from_bytes(raw)
 
     msg_bytes = to_bytes_versioned(tx.message)
     my_sig    = keypair.sign_message(msg_bytes)
 
-    # 기존 서명 목록에서 내 pubkey 위치만 교체
     sigs         = list(tx.signatures)
     account_keys = tx.message.account_keys
     my_pubkey    = keypair.pubkey()
@@ -187,7 +187,6 @@ def sign_and_send(tx_b64: str, keypair: Keypair) -> tuple[str, bool]:
             sigs[i] = my_sig
             break
     else:
-        # 위치를 못 찾으면 0번 슬롯에 삽입
         if sigs:
             sigs[0] = my_sig
         else:
@@ -208,15 +207,18 @@ def buy_elaz(keypair: Keypair, multiplier: float = 1.0):
 
         sol_bal = get_sol_balance(pubkey)
         if sol_bal < sol_amount + 0.005:
+            logging.warning(f"[{pubkey[:8]}] SOL 잔액 부족: {sol_bal:.4f}")
             return None, False, f"SOL 잔액 부족 ({sol_bal:.4f})"
 
+        logging.info(f"[{pubkey[:8]}] 매수 시도: {sol_amount:.4f} SOL")
         quote  = jupiter_quote(WSOL_MINT, TOKEN_MINT, lamports)
         tx_b64 = jupiter_swap_tx(quote, pubkey)
         sig, ok = sign_and_send(tx_b64, keypair)
+        logging.info(f"[{pubkey[:8]}] 매수 결과: {'성공' if ok else '실패'} sig={sig}")
         return sig, ok, f"{sol_amount:.4f} SOL"
 
     except Exception as e:
-        logging.error(f"매수 오류 ({str(keypair.pubkey())[:8]}): {e}")
+        logging.error(f"매수 오류 ({str(keypair.pubkey())[:8]}): {e}", exc_info=True)
         return None, False, str(e)[:100]
 
 # ─── 매도 (ELAZ → SOL) ────────────────────────────────────────────
@@ -225,6 +227,7 @@ def sell_elaz(keypair: Keypair, multiplier: float = 1.0):
         pubkey  = str(keypair.pubkey())
         balance = get_token_balance(pubkey, TOKEN_MINT)
         if balance == 0:
+            logging.warning(f"[{pubkey[:8]}] ELAZ 잔액 없음")
             return None, False, "ELAZ 잔액없음"
 
         pct       = random.uniform(2, MAX_SELL_PCT) / 100 * multiplier
@@ -233,24 +236,27 @@ def sell_elaz(keypair: Keypair, multiplier: float = 1.0):
         if amount_in == 0:
             return None, False, "매도량 0"
 
+        logging.info(f"[{pubkey[:8]}] 매도 시도: {amount_in} ELAZ raw")
         quote  = jupiter_quote(TOKEN_MINT, WSOL_MINT, amount_in)
         tx_b64 = jupiter_swap_tx(quote, pubkey)
         sig, ok = sign_and_send(tx_b64, keypair)
 
         decimals = 6
         readable = amount_in / (10 ** decimals)
+        logging.info(f"[{pubkey[:8]}] 매도 결과: {'성공' if ok else '실패'} sig={sig}")
         return sig, ok, f"{readable:.2f} ELAZ"
 
     except Exception as e:
-        logging.error(f"매도 오류 ({str(keypair.pubkey())[:8]}): {e}")
+        logging.error(f"매도 오류 ({str(keypair.pubkey())[:8]}): {e}", exc_info=True)
         return None, False, str(e)[:100]
 
-# ─── 지갑별 자동거래 루프 ─────────────────────────────────────────
+# ─── 지갑별 자동거래 루프 (초기 대기 제거) ────────────────────────
 def wallet_trading_loop(keypair: Keypair, min_wait_sec: int, max_wait_sec: int,
                         wallet_label: str, multiplier: float = 1.0):
-    time.sleep(random.randint(0, 600))
+    # ✅ 수정: 초기 무작위 대기 제거 (즉시 시작)
+    logging.info(f"[{wallet_label}] 거래 루프 시작")
 
-    while is_trading():  # ✅ 스레드 안전 체크
+    while is_trading():
         try:
             # ── 매수 ──
             sig, ok, info = buy_elaz(keypair, multiplier)
@@ -261,6 +267,7 @@ def wallet_trading_loop(keypair: Keypair, min_wait_sec: int, max_wait_sec: int,
                 daily_log.append(f"   └ https://solscan.io/tx/{sig}")
 
             wait = random.randint(min_wait_sec, max_wait_sec)
+            logging.info(f"[{wallet_label}] 다음 매도까지 {wait}초 대기")
             for _ in range(wait):
                 if not is_trading():
                     return
@@ -275,13 +282,14 @@ def wallet_trading_loop(keypair: Keypair, min_wait_sec: int, max_wait_sec: int,
                 daily_log.append(f"   └ https://solscan.io/tx/{sig}")
 
             wait = random.randint(min_wait_sec, max_wait_sec)
+            logging.info(f"[{wallet_label}] 다음 매수까지 {wait}초 대기")
             for _ in range(wait):
                 if not is_trading():
                     return
                 time.sleep(1)
 
         except Exception as e:
-            logging.error(f"{wallet_label} 루프 오류: {e}")
+            logging.error(f"{wallet_label} 루프 오류: {e}", exc_info=True)  # ✅ 상세 로그
             time.sleep(60)
 
 # ─── 하루 2회 보고 스케줄러 ───────────────────────────────────────
@@ -305,7 +313,6 @@ def daily_report_loop(chat_id):
             wait = (24 - now.hour + target_hours[0]) * 3600 - now.minute * 60
         wait = max(wait, 60)
 
-        # 1초씩 쪼개서 trading 중지 시 빠르게 탈출
         for _ in range(min(wait, 3600)):
             if not is_trading():
                 return
@@ -326,7 +333,7 @@ async def handle_update(update_data):
             return
         user_id   = update.effective_user.id
         chat_id   = update.message.chat_id
-        user_text = update.message.text
+        user_text = update.message.text.strip()  # ✅ 수정: strip() 추가
 
         # ── /start ──
         if user_text == "/start":
@@ -375,7 +382,7 @@ async def handle_update(update_data):
             t1.start()
             trading_threads.append(t1)
 
-            # 추가 지갑: 하루 5~6회 (2~4.5시간 간격)
+            # 추가 지갑
             for idx, key in EXTRA_WALLET_KEYS:
                 kp    = parse_keypair(key)
                 mult  = LARGE_WALLET_MULTIPLIER if idx == LARGE_WALLET_INDEX else 1.0
@@ -467,7 +474,7 @@ async def handle_update(update_data):
 
         await bot.send_message(chat_id=chat_id, text=reply)
 
-# ─── Flask webhook: asyncio.run() 스레드 분리 ✅ ──────────────────
+# ─── Flask webhook ────────────────────────────────────────────────
 def _run_in_thread(data):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
