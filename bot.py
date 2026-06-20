@@ -53,9 +53,9 @@ JUPITER_SWAP_ENDPOINTS = [
 ]
 
 # ─── 안전 설정 ────────────────────────────────────────────────────
-MIN_SOL            = 0.003   # 소량
-MAX_SOL            = 0.008   # 소량
-MAX_SELL_PCT       = 5
+MIN_SOL            = 0.001   # 0.003 → 0.001
+MAX_SOL            = 0.003   # 0.008 → 0.003
+MAX_SELL_PCT       = 2       # 5 → 2% (풀 SOL 보호)
 SLIPPAGE_BPS       = 50      # 0.5%
 PRIORITY_FEE_MICRO = 300000
 
@@ -301,19 +301,19 @@ def interruptible_sleep(seconds: int) -> bool:
 def main_wallet_loop(keypair: Keypair):
     label     = "메인"
     buy_count = 0  # 연속 매수 횟수 추적
-    logging.info(f"[{label}] 거래 루프 시작 — 즉시 첫 매수 (매수2:매도1 패턴)")
+    logging.info(f"[{label}] 거래 루프 시작 — 즉시 첫 매수 (매수3:매도1 패턴)")
 
     while is_trading():
         try:
-            if buy_count < 2:
+            if buy_count < 3:
                 # 매수
                 sig, ok, info = buy_elaz(keypair)
                 log_trade(label, "매수", sig, ok, info)
                 if ok:
                     buy_count += 1
-                    logging.info(f"[{label}] 매수 누적 {buy_count}/2")
+                    logging.info(f"[{label}] 매수 누적 {buy_count}/3")
             else:
-                # 매수 2회 완료 → 매도 1회
+                # 매수 3회 완료 → 매도 1회
                 sig, ok, info = sell_elaz(keypair)
                 log_trade(label, "매도", sig, ok, info)
                 if ok:
@@ -474,7 +474,7 @@ async def handle_update(update_data):
                     f"📌 거래량: {MIN_SOL}~{MAX_SOL} SOL (소량)\n"
                     f"📌 슬리피지: {SLIPPAGE_BPS/100:.1f}%\n"
                     f"📌 패턴: 매수/매도 1:1 번갈아\n\n"
-                    f"🔹 메인 지갑: 즉시 시작, 45~75분 간격\n"
+                    f"🔹 메인 지갑: 즉시 시작, 45~75분 간격 (매수3:매도1)\n"
                     f"🔹 추가 지갑 {len(EXTRA_WALLET_KEYS)}개: 랜덤 분산, 하루 4~5회\n"
                     f"   (지갑{LARGE_WALLET_INDEX}은 거래량 {LARGE_WALLET_MULTIPLIER}배)\n\n"
                     f"📊 리포트: 매일 오전9시/오후9시"
