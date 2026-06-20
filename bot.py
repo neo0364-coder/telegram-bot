@@ -57,7 +57,7 @@ MIN_SOL            = 0.001   # 0.003 → 0.001
 MAX_SOL            = 0.003   # 0.008 → 0.003
 MAX_SELL_PCT       = 2       # 5 → 2% (풀 SOL 보호)
 SLIPPAGE_BPS       = 50      # 0.5%
-PRIORITY_FEE_MICRO = 300000
+PRIORITY_FEE_MICRO = 50000   # 300000 → 50000 (0.00005 SOL)
 
 # ─── 스레드 안전 상태 관리 ────────────────────────────────────────
 _state_lock          = threading.Lock()
