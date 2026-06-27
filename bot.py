@@ -702,11 +702,17 @@ def webhook():
 
 @app.route("/set_webhook")
 def set_webhook():
-    async def _set():
-        async with Bot(token=TELEGRAM_TOKEN) as bot:
-            await bot.set_webhook(f"{WEBHOOK_URL}/webhook")
-    asyncio.run(_set())
-    return f"Webhook set to {WEBHOOK_URL}/webhook"
+    import httpx as _httpx
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+        resp = _httpx.post(url, json={"url": f"{WEBHOOK_URL}/webhook"}, timeout=30)
+        data = resp.json()
+        if data.get("ok"):
+            return f"✅ Webhook set to {WEBHOOK_URL}/webhook"
+        else:
+            return f"❌ 실패: {data}", 500
+    except Exception as e:
+        return f"❌ 오류: {e}", 500
 
 @app.route("/")
 def index():
