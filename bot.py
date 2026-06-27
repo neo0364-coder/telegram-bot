@@ -29,7 +29,7 @@ TAVILY_API_KEY  = os.environ["TAVILY_API_KEY"]
 
 RPC_URL         = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
 BOT_PRIVATE_KEY = os.environ["BOT_PRIVATE_KEY2"]
-TOKEN_MINT      = os.environ.get("TOKEN_MINT", "GNEuYzCanJP7rj4BB1VGh53JWhWkbeKVYDpzNzsg4hyh")
+TOKEN_MINT      = os.environ.get("TOKEN_MINT", "Hma4KPrjv5skxgDjkNHMAAyDHEqx1bw2tS5aok2qBBgs")
 
 EXTRA_WALLET_KEYS = []
 for i in range(1, 11):
@@ -38,6 +38,7 @@ for i in range(1, 11):
         EXTRA_WALLET_KEYS.append((i, key))
 
 LARGE_WALLET_INDEX      = 5
+EXCLUDE_WALLET_INDEXES  = [4]  # 거래 제외 지갑
 LARGE_WALLET_MULTIPLIER = 1.5
 
 # ─── Jupiter API (메인 + 폴백) ────────────────────────────────────
@@ -53,18 +54,20 @@ JUPITER_SWAP_ENDPOINTS = [
 ]
 
 # ─── 안전 설정 ────────────────────────────────────────────────────
-MIN_SOL            = 0.001   # 0.003 → 0.001
-MAX_SOL            = 0.003   # 0.008 → 0.003
-MAX_SELL_PCT       = 2       # 5 → 2% (풀 SOL 보호)
-SLIPPAGE_BPS       = 50      # 0.5%
-PRIORITY_FEE_MICRO = 50000   # 300000 → 50000 (0.00005 SOL)
+MIN_SOL            = 0.001
+MAX_SOL            = 0.003
+SLIPPAGE_BPS       = 50       # 0.5%
+PRIORITY_FEE_MICRO = 50000    # 0.00005 SOL
+TOKEN_DECIMALS     = 9        # 새 토큰 소수점 자리수 (보통 6)
 
 # ─── 스레드 안전 상태 관리 ────────────────────────────────────────
-_state_lock          = threading.Lock()
-trading_active       = False
-trading_threads      = []
-daily_log            = []
-conversation_history = {}
+_state_lock           = threading.Lock()
+trading_active        = False
+trading_threads       = []
+daily_log             = []
+conversation_history  = {}
+alert_chat_id         = None
+MAX_CONSECUTIVE_FAILS = 3
 
 def set_trading(val: bool):
     global trading_active
@@ -98,6 +101,22 @@ SEARCH_KEYWORDS = ["현재","지금","오늘","최신","최근","주가","날씨
 
 def needs_search(text):
     return any(k in text for k in SEARCH_KEYWORDS)
+
+# ─── 자동 중지 + 텔레그램 알림 ───────────────────────────────────
+def auto_stop(reason: str):
+    set_trading(False)
+    logging.error(f"자동 중지: {reason}")
+    if alert_chat_id:
+        async def _send():
+            async with Bot(token=TELEGRAM_TOKEN) as bot:
+                await bot.send_message(
+                    chat_id=alert_chat_id,
+                    text=f"🚨 자동거래 자동 중지!\n\n사유: {reason}\n\n/starttrading 으로 재시작 가능합니다."
+                )
+        try:
+            asyncio.run(_send())
+        except Exception as e:
+            logging.error(f"알림 전송 실패: {e}")
 
 # ─── RPC 유틸 ─────────────────────────────────────────────────────
 def rpc_post(method: str, params: list):
@@ -230,7 +249,8 @@ def sign_and_send(tx_b64: str, keypair: Keypair) -> tuple[str, bool]:
     return tx_sig, ok
 
 # ─── 매수 (SOL → TOKEN) ───────────────────────────────────────────
-def buy_elaz(keypair: Keypair, multiplier: float = 1.0):
+# 반환값: (sig, ok, info, received_token_amount)
+def buy_token(keypair: Keypair, multiplier: float = 1.0):
     try:
         pubkey     = str(keypair.pubkey())
         sol_amount = random.uniform(MIN_SOL, MAX_SOL) * multiplier
@@ -239,42 +259,67 @@ def buy_elaz(keypair: Keypair, multiplier: float = 1.0):
         sol_bal = get_sol_balance(pubkey)
         if sol_bal < sol_amount + 0.005:
             logging.warning(f"[{pubkey[:8]}] SOL 잔액 부족: {sol_bal:.4f}")
-            return None, False, f"SOL 잔액 부족 ({sol_bal:.4f})"
+            return None, False, f"SOL 잔액 부족 ({sol_bal:.4f})", 0
 
         logging.info(f"[{pubkey[:8]}] 매수 시도: {sol_amount:.4f} SOL")
-        quote   = jupiter_quote(WSOL_MINT, TOKEN_MINT, lamports)
-        tx_b64  = jupiter_swap_tx(quote, pubkey)
-        sig, ok = sign_and_send(tx_b64, keypair)
+
+        # 매수 전 토큰 잔고 스냅샷
+        before_balance = get_token_balance(pubkey, TOKEN_MINT)
+
+        quote    = jupiter_quote(WSOL_MINT, TOKEN_MINT, lamports)
+        expected = int(quote.get("outAmount", 0))  # Jupiter 예상 수령량
+        tx_b64   = jupiter_swap_tx(quote, pubkey)
+        sig, ok  = sign_and_send(tx_b64, keypair)
+
+        received = 0
+        if ok:
+            # 매수 후 실제 수령량 = 잔고 변화
+            after_balance = get_token_balance(pubkey, TOKEN_MINT)
+            received = after_balance - before_balance
+            if received <= 0:
+                received = expected  # 잔고 조회 실패 시 예상값 사용
+            logging.info(f"[{pubkey[:8]}] 매수 성공 — {received} raw token 수령")
+
         logging.info(f"[{pubkey[:8]}] 매수 결과: {'성공' if ok else '실패'} sig={sig}")
-        return sig, ok, f"{sol_amount:.4f} SOL"
+        return sig, ok, f"{sol_amount:.4f} SOL", received
 
     except Exception as e:
         logging.error(f"매수 오류 ({str(keypair.pubkey())[:8]}): {e}", exc_info=True)
-        return None, False, str(e)[:100]
+        return None, False, str(e)[:100], 0
 
 # ─── 매도 (TOKEN → SOL) ───────────────────────────────────────────
-def sell_elaz(keypair: Keypair, multiplier: float = 1.0):
+# received_amount: 직전 매수에서 받은 토큰량
+# 매도량 = 매수량의 91~100% 랜덤 (매수량과 같거나 최대 10% 적게)
+def sell_token(keypair: Keypair, received_amount: int = 0, multiplier: float = 1.0):
     try:
         pubkey  = str(keypair.pubkey())
         balance = get_token_balance(pubkey, TOKEN_MINT)
         if balance == 0:
-            logging.warning(f"[{pubkey[:8]}] ELAZ 잔액 없음")
-            return None, False, "ELAZ 잔액없음"
+            logging.warning(f"[{pubkey[:8]}] 토큰 잔액 없음")
+            return None, False, "토큰 잔액없음"
 
-        pct       = random.uniform(1, MAX_SELL_PCT) / 100 * multiplier
-        pct       = min(pct, 0.95)
-        amount_in = int(balance * pct)
+        if received_amount > 0:
+            # 매수량의 90~100% 랜덤 매도 (10% 이내로 적게)
+            sell_ratio = random.uniform(0.90, 1.00)
+            amount_in  = min(int(received_amount * sell_ratio * multiplier), balance)
+            logging.info(f"[{pubkey[:8]}] 매도 비율: {sell_ratio:.2%} of {received_amount}")
+        else:
+            # fallback: 잔고의 1% 소량 매도
+            amount_in = max(1, int(balance * 0.01))
+
+        amount_in = min(amount_in, balance)  # 잔고 초과 방지
+
         if amount_in == 0:
             return None, False, "매도량 0"
 
-        logging.info(f"[{pubkey[:8]}] 매도 시도: {amount_in} ELAZ raw")
+        logging.info(f"[{pubkey[:8]}] 매도 시도: {amount_in} raw token")
         quote   = jupiter_quote(TOKEN_MINT, WSOL_MINT, amount_in)
         tx_b64  = jupiter_swap_tx(quote, pubkey)
         sig, ok = sign_and_send(tx_b64, keypair)
 
-        readable = amount_in / (10 ** 6)
+        readable = amount_in / (10 ** TOKEN_DECIMALS)
         logging.info(f"[{pubkey[:8]}] 매도 결과: {'성공' if ok else '실패'} sig={sig}")
-        return sig, ok, f"{readable:.2f} ELAZ"
+        return sig, ok, f"{readable:.4f} TOKEN"
 
     except Exception as e:
         logging.error(f"매도 오류 ({str(keypair.pubkey())[:8]}): {e}", exc_info=True)
@@ -297,69 +342,177 @@ def interruptible_sleep(seconds: int) -> bool:
     return True
 
 # ─── 메인 지갑 루프 ───────────────────────────────────────────────
-# /starttrading 즉시 매수 → 매수 2회마다 매도 1회 → 45~75분 간격
+# 즉시 매수 → 매수 2회마다 매도 1회 → 45~75분 간격
+# 매도 시 직전 매수에서 받은 토큰량만 매도 (풀 균형 유지)
 def main_wallet_loop(keypair: Keypair):
-    label     = "메인"
-    buy_count = 0  # 연속 매수 횟수 추적
-    logging.info(f"[{label}] 거래 루프 시작 — 즉시 첫 매수 (매수3:매도1 패턴)")
+    label          = "메인"
+    buy_count      = 0
+    fail_count     = 0
+    pending_tokens = 0  # 누적 미매도 토큰량
+    logging.info(f"[{label}] 거래 루프 시작 — 즉시 첫 매수 (매수2:매도1)")
 
     while is_trading():
         try:
-            if buy_count < 3:
-                # 매수
-                sig, ok, info = buy_elaz(keypair)
+            sol_bal = get_sol_balance(str(keypair.pubkey()))
+            if sol_bal < 0.002:
+                auto_stop(f"[{label}] SOL 잔액 부족 ({sol_bal:.4f} SOL)")
+                return
+
+            if buy_count < 2:
+                sig, ok, info, received = buy_token(keypair)
                 log_trade(label, "매수", sig, ok, info)
                 if ok:
-                    buy_count += 1
-                    logging.info(f"[{label}] 매수 누적 {buy_count}/3")
+                    buy_count      += 1
+                    fail_count      = 0
+                    pending_tokens += received
+                    logging.info(f"[{label}] 매수 {buy_count}/2 — 누적 미매도 {pending_tokens}")
+                else:
+                    fail_count += 1
             else:
-                # 매수 3회 완료 → 매도 1회
-                sig, ok, info = sell_elaz(keypair)
+                # 2회 매수에서 받은 토큰 매도
+                sig, ok, info = sell_token(keypair, received_amount=pending_tokens)
                 log_trade(label, "매도", sig, ok, info)
                 if ok:
-                    buy_count = 0
+                    buy_count      = 0
+                    fail_count     = 0
+                    pending_tokens = 0
                     logging.info(f"[{label}] 매도 완료 — 카운트 초기화")
+                else:
+                    fail_count += 1
 
-            # 45~75분 랜덤 간격
+            if fail_count >= MAX_CONSECUTIVE_FAILS:
+                auto_stop(f"[{label}] 연속 {fail_count}회 거래 실패")
+                return
+
             wait = random.randint(45 * 60, 75 * 60)
             logging.info(f"[{label}] 다음 거래까지 {wait//60}분 대기")
             if not interruptible_sleep(wait):
                 return
 
         except Exception as e:
-            logging.error(f"[{label}] 루프 오류: {e}", exc_info=True)
+            fail_count += 1
+            logging.error(f"[{label}] 루프 오류 ({fail_count}/{MAX_CONSECUTIVE_FAILS}): {e}", exc_info=True)
+            if fail_count >= MAX_CONSECUTIVE_FAILS:
+                auto_stop(f"[{label}] 연속 {fail_count}회 오류: {str(e)[:80]}")
+                return
             time.sleep(60)
 
-# ─── 추가 지갑 루프 ───────────────────────────────────────────────
-# 하루 4~5회, 매수/매도 번갈아, 초기 랜덤 딜레이로 지갑 분산
-def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0):
-    # 초기 딜레이: 0~6시간 랜덤
+# ─── 지갑1 전용 루프 (매수2:매도1) ──────────────────────────────
+def wallet1_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0):
     initial_delay = random.randint(0, 6 * 3600)
-    logging.info(f"[{wallet_label}] 거래 루프 시작 — 초기 대기 {initial_delay//60}분")
+    logging.info(f"[{wallet_label}] 거래 루프 시작 — 초기 대기 {initial_delay//60}분 (매수2:매도1)")
     if not interruptible_sleep(initial_delay):
         return
 
-    next_action = "buy"
+    buy_count      = 0
+    fail_count     = 0
+    pending_tokens = 0  # 누적 미매도 토큰량
 
     while is_trading():
         try:
-            if next_action == "buy":
-                sig, ok, info = buy_elaz(keypair, multiplier)
-                log_trade(wallet_label, "매수", sig, ok, info)
-                next_action = "sell"
-            else:
-                sig, ok, info = sell_elaz(keypair, multiplier)
-                log_trade(wallet_label, "매도", sig, ok, info)
-                next_action = "buy"
+            sol_bal = get_sol_balance(str(keypair.pubkey()))
+            if sol_bal < 0.002:
+                logging.warning(f"[{wallet_label}] SOL 잔액 부족 ({sol_bal:.4f}) — 거래 중단")
+                daily_log.append(f"⚠️ [{wallet_label}] SOL 부족으로 거래 중단")
+                return
 
-            # 하루 4~5회 → 거래 간격 240~360분 랜덤 (기존과 동일)
+            if buy_count < 2:
+                sig, ok, info, received = buy_token(keypair, multiplier)
+                log_trade(wallet_label, "매수", sig, ok, info)
+                if ok:
+                    buy_count      += 1
+                    fail_count      = 0
+                    pending_tokens += received
+                    logging.info(f"[{wallet_label}] 매수 {buy_count}/2")
+                else:
+                    fail_count += 1
+            else:
+                # 매수 2회 누적 토큰 매도
+                sig, ok, info = sell_token(keypair, received_amount=pending_tokens, multiplier=multiplier)
+                log_trade(wallet_label, "매도", sig, ok, info)
+                if ok:
+                    buy_count      = 0
+                    fail_count     = 0
+                    pending_tokens = 0
+                    logging.info(f"[{wallet_label}] 매도 완료 — 카운트 초기화")
+                else:
+                    fail_count += 1
+
+            if fail_count >= MAX_CONSECUTIVE_FAILS:
+                logging.warning(f"[{wallet_label}] 연속 {fail_count}회 실패 — 거래 중단")
+                daily_log.append(f"⚠️ [{wallet_label}] 연속 {fail_count}회 실패로 거래 중단")
+                return
+
             wait = random.randint(240 * 60, 360 * 60)
             logging.info(f"[{wallet_label}] 다음 거래까지 {wait//60}분 대기")
             if not interruptible_sleep(wait):
                 return
 
         except Exception as e:
-            logging.error(f"[{wallet_label}] 루프 오류: {e}", exc_info=True)
+            fail_count += 1
+            logging.error(f"[{wallet_label}] 루프 오류 ({fail_count}/{MAX_CONSECUTIVE_FAILS}): {e}", exc_info=True)
+            if fail_count >= MAX_CONSECUTIVE_FAILS:
+                logging.warning(f"[{wallet_label}] 연속 오류로 거래 중단")
+                return
+            time.sleep(60)
+
+# ─── 추가 지갑 루프 ───────────────────────────────────────────────
+# 초기 랜덤 딜레이 후 하루 4~5회, 매수/매도 번갈아
+# 매도 시 직전 매수에서 받은 토큰량만 매도
+def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0):
+    initial_delay = random.randint(0, 6 * 3600)
+    logging.info(f"[{wallet_label}] 거래 루프 시작 — 초기 대기 {initial_delay//60}분")
+    if not interruptible_sleep(initial_delay):
+        return
+
+    next_action    = "buy"
+    fail_count     = 0
+    last_received  = 0  # 직전 매수에서 받은 토큰량
+
+    while is_trading():
+        try:
+            sol_bal = get_sol_balance(str(keypair.pubkey()))
+            if sol_bal < 0.002:
+                logging.warning(f"[{wallet_label}] SOL 잔액 부족 ({sol_bal:.4f}) — 거래 중단")
+                daily_log.append(f"⚠️ [{wallet_label}] SOL 부족으로 거래 중단")
+                return
+
+            if next_action == "buy":
+                sig, ok, info, received = buy_token(keypair, multiplier)
+                log_trade(wallet_label, "매수", sig, ok, info)
+                if ok:
+                    next_action   = "sell"
+                    fail_count    = 0
+                    last_received = received
+                else:
+                    fail_count += 1
+            else:
+                # 직전 매수에서 받은 토큰만 매도
+                sig, ok, info = sell_token(keypair, received_amount=last_received, multiplier=multiplier)
+                log_trade(wallet_label, "매도", sig, ok, info)
+                if ok:
+                    next_action   = "buy"
+                    fail_count    = 0
+                    last_received = 0
+                else:
+                    fail_count += 1
+
+            if fail_count >= MAX_CONSECUTIVE_FAILS:
+                logging.warning(f"[{wallet_label}] 연속 {fail_count}회 실패 — 거래 중단")
+                daily_log.append(f"⚠️ [{wallet_label}] 연속 {fail_count}회 실패로 거래 중단")
+                return
+
+            wait = random.randint(240 * 60, 360 * 60)
+            logging.info(f"[{wallet_label}] 다음 거래까지 {wait//60}분 대기")
+            if not interruptible_sleep(wait):
+                return
+
+        except Exception as e:
+            fail_count += 1
+            logging.error(f"[{wallet_label}] 루프 오류 ({fail_count}/{MAX_CONSECUTIVE_FAILS}): {e}", exc_info=True)
+            if fail_count >= MAX_CONSECUTIVE_FAILS:
+                logging.warning(f"[{wallet_label}] 연속 오류로 거래 중단")
+                return
             time.sleep(60)
 
 # ─── 하루 2회 보고 스케줄러 ───────────────────────────────────────
@@ -393,7 +546,7 @@ def daily_report_loop(chat_id):
 
 # ─── 텔레그램 핸들러 ──────────────────────────────────────────────
 async def handle_update(update_data):
-    global trading_threads
+    global trading_threads, alert_chat_id
     bot = Bot(token=TELEGRAM_TOKEN)
     async with bot:
         update = Update.de_json(update_data, bot)
@@ -403,11 +556,10 @@ async def handle_update(update_data):
         chat_id   = update.message.chat_id
         user_text = update.message.text.strip()
 
-        # ── /start ──
         if user_text == "/start":
             conversation_history[user_id] = []
             await bot.send_message(chat_id=chat_id, text=(
-                "안녕하세요! ELAZ 자동거래 봇입니다 🚀\n\n"
+                "안녕하세요! 자동거래 봇입니다 🚀\n\n"
                 "📈 거래 명령어:\n"
                 "/starttrading - 자동거래 시작\n"
                 "/stoptrading  - 자동거래 중지\n"
@@ -417,13 +569,11 @@ async def handle_update(update_data):
             ))
             return
 
-        # ── /reset ──
         if user_text == "/reset":
             conversation_history[user_id] = []
             await bot.send_message(chat_id=chat_id, text="대화 기록이 초기화되었습니다.")
             return
 
-        # ── /report ──
         if user_text == "/report":
             if not daily_log:
                 await bot.send_message(chat_id=chat_id, text="아직 거래 내역이 없습니다.")
@@ -432,69 +582,60 @@ async def handle_update(update_data):
                 await bot.send_message(chat_id=chat_id, text=msg[:4000])
             return
 
-        # ── /starttrading ──
         if user_text == "/starttrading":
             if is_trading():
                 await bot.send_message(chat_id=chat_id, text="이미 자동거래가 실행 중입니다!")
                 return
 
             set_trading(True)
+            alert_chat_id  = chat_id
             trading_threads = []
 
-            # 메인 지갑: 즉시 매수, 45~75분 간격으로 매수/매도 번갈아
-            t_main = threading.Thread(
-                target=main_wallet_loop,
-                args=(BOT_KEYPAIR,),
-                daemon=True
-            )
+            t_main = threading.Thread(target=main_wallet_loop, args=(BOT_KEYPAIR,), daemon=True)
             t_main.start()
             trading_threads.append(t_main)
 
-            # 추가 지갑: 랜덤 딜레이 후 하루 4~5회 매수/매도 번갈아
             for idx, key in EXTRA_WALLET_KEYS:
+                if idx in EXCLUDE_WALLET_INDEXES:
+                    logging.info(f"지갑{idx} 거래 제외")
+                    continue
                 kp    = parse_keypair(key)
                 mult  = LARGE_WALLET_MULTIPLIER if idx == LARGE_WALLET_INDEX else 1.0
                 label = f"지갑{idx}" + (" (대형)" if mult > 1.0 else "")
-                t = threading.Thread(
-                    target=extra_wallet_loop,
-                    args=(kp, label, mult),
-                    daemon=True
-                )
+                target = extra_wallet_loop
+                t = threading.Thread(target=target, args=(kp, label, mult), daemon=True)
                 t.start()
                 trading_threads.append(t)
 
-            # 보고 스케줄러
             rt = threading.Thread(target=daily_report_loop, args=(chat_id,), daemon=True)
             rt.start()
 
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"✅ ELAZ 자동거래 시작!\n\n"
-                    f"📌 거래량: {MIN_SOL}~{MAX_SOL} SOL (소량)\n"
+                    f"✅ 자동거래 시작!\n\n"
+                    f"📌 거래량: {MIN_SOL}~{MAX_SOL} SOL\n"
                     f"📌 슬리피지: {SLIPPAGE_BPS/100:.1f}%\n"
-                    f"📌 패턴: 매수/매도 1:1 번갈아\n\n"
-                    f"🔹 메인 지갑: 즉시 시작, 45~75분 간격 (매수3:매도1)\n"
-                    f"🔹 추가 지갑 {len(EXTRA_WALLET_KEYS)}개: 랜덤 분산, 하루 4~5회\n"
-                    f"   (지갑{LARGE_WALLET_INDEX}은 거래량 {LARGE_WALLET_MULTIPLIER}배)\n\n"
+                    f"📌 메인: 매수2:매도1, 45~75분 간격\n"
+                    f"📌 추가 지갑 {len(EXTRA_WALLET_KEYS)}개: 매수1:매도1, 하루 4~5회\n"
+                    f"📌 매도량: 직전 매수에서 받은 토큰량만 매도 (풀 균형 유지)\n"
+                    f"📌 연속 {MAX_CONSECUTIVE_FAILS}회 실패 시 자동 중지\n\n"
                     f"📊 리포트: 매일 오전9시/오후9시"
                 )
             )
             return
 
-        # ── /stoptrading ──
         if user_text == "/stoptrading":
             set_trading(False)
             await bot.send_message(chat_id=chat_id, text="⛔ 자동거래 중지되었습니다.")
             return
 
-        # ── /balance ──
         if user_text == "/balance":
             try:
                 msg = f"💰 지갑 잔액\n\n메인 ({BOT_ADDRESS[:8]}...)\n"
                 sol = get_sol_balance(BOT_ADDRESS)
                 tok = get_token_balance(BOT_ADDRESS, TOKEN_MINT)
-                msg += f"SOL: {sol:.4f}\nELAZ: {tok / 1e6:.2f}\n"
+                msg += f"SOL: {sol:.4f}\nTOKEN: {tok / (10**TOKEN_DECIMALS):.2f}\n"
 
                 for idx, key in EXTRA_WALLET_KEYS:
                     kp   = parse_keypair(key)
@@ -502,7 +643,7 @@ async def handle_update(update_data):
                     s    = get_sol_balance(addr)
                     t    = get_token_balance(addr, TOKEN_MINT)
                     tag  = " (대형)" if idx == LARGE_WALLET_INDEX else ""
-                    msg += f"\n지갑{idx}{tag} ({addr[:8]}...)\nSOL: {s:.4f}\nELAZ: {t/1e6:.2f}\n"
+                    msg += f"\n지갑{idx}{tag} ({addr[:8]}...)\nSOL: {s:.4f}\nTOKEN: {t/(10**TOKEN_DECIMALS):.2f}\n"
 
                 await bot.send_message(chat_id=chat_id, text=msg)
             except Exception as e:
@@ -569,7 +710,7 @@ def set_webhook():
 
 @app.route("/")
 def index():
-    return "ELAZ Bot is running! 🚀"
+    return "Bot is running! 🚀"
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
