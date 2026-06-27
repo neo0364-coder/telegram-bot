@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 # ─── 환경변수 ─────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY    = os.environ["GROQ_API_KEY"]
-WEBHOOK_URL     = os.environ["WEBHOOK_URL"]
+WEBHOOK_URL     = os.environ["WEBHOOK_URL"].rstrip("/")  # 끝 슬래시 제거
 TAVILY_API_KEY  = os.environ["TAVILY_API_KEY"]
 
 RPC_URL         = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -38,7 +38,7 @@ for i in range(1, 11):
         EXTRA_WALLET_KEYS.append((i, key))
 
 LARGE_WALLET_INDEX      = 5
-EXCLUDE_WALLET_INDEXES  = [4]  # 거래 제외 지갑
+EXCLUDE_WALLET_INDEXES  = [4]
 LARGE_WALLET_MULTIPLIER = 1.5
 
 # ─── Jupiter API (메인 + 폴백) ────────────────────────────────────
@@ -56,9 +56,9 @@ JUPITER_SWAP_ENDPOINTS = [
 # ─── 안전 설정 ────────────────────────────────────────────────────
 MIN_SOL            = 0.001
 MAX_SOL            = 0.003
-SLIPPAGE_BPS       = 50       # 0.5%
-PRIORITY_FEE_MICRO = 50000    # 0.00005 SOL
-TOKEN_DECIMALS     = 9        # 새 토큰 소수점 자리수 (보통 6)
+SLIPPAGE_BPS       = 50
+PRIORITY_FEE_MICRO = 50000
+TOKEN_DECIMALS     = 9
 
 # ─── 스레드 안전 상태 관리 ────────────────────────────────────────
 _state_lock           = threading.Lock()
@@ -107,16 +107,20 @@ def auto_stop(reason: str):
     set_trading(False)
     logging.error(f"자동 중지: {reason}")
     if alert_chat_id:
-        async def _send():
-            async with Bot(token=TELEGRAM_TOKEN) as bot:
-                await bot.send_message(
-                    chat_id=alert_chat_id,
-                    text=f"🚨 자동거래 자동 중지!\n\n사유: {reason}\n\n/starttrading 으로 재시작 가능합니다."
-                )
-        try:
-            asyncio.run(_send())
-        except Exception as e:
-            logging.error(f"알림 전송 실패: {e}")
+        def _send():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            async def _inner():
+                async with Bot(token=TELEGRAM_TOKEN) as bot:
+                    await bot.send_message(
+                        chat_id=alert_chat_id,
+                        text=f"🚨 자동거래 자동 중지!\n\n사유: {reason}\n\n/starttrading 으로 재시작 가능합니다."
+                    )
+            try:
+                loop.run_until_complete(_inner())
+            finally:
+                loop.close()
+        threading.Thread(target=_send, daemon=True).start()
 
 # ─── RPC 유틸 ─────────────────────────────────────────────────────
 def rpc_post(method: str, params: list):
@@ -249,7 +253,6 @@ def sign_and_send(tx_b64: str, keypair: Keypair) -> tuple[str, bool]:
     return tx_sig, ok
 
 # ─── 매수 (SOL → TOKEN) ───────────────────────────────────────────
-# 반환값: (sig, ok, info, received_token_amount)
 def buy_token(keypair: Keypair, multiplier: float = 1.0):
     try:
         pubkey     = str(keypair.pubkey())
@@ -263,21 +266,19 @@ def buy_token(keypair: Keypair, multiplier: float = 1.0):
 
         logging.info(f"[{pubkey[:8]}] 매수 시도: {sol_amount:.4f} SOL")
 
-        # 매수 전 토큰 잔고 스냅샷
         before_balance = get_token_balance(pubkey, TOKEN_MINT)
 
         quote    = jupiter_quote(WSOL_MINT, TOKEN_MINT, lamports)
-        expected = int(quote.get("outAmount", 0))  # Jupiter 예상 수령량
+        expected = int(quote.get("outAmount", 0))
         tx_b64   = jupiter_swap_tx(quote, pubkey)
         sig, ok  = sign_and_send(tx_b64, keypair)
 
         received = 0
         if ok:
-            # 매수 후 실제 수령량 = 잔고 변화
             after_balance = get_token_balance(pubkey, TOKEN_MINT)
             received = after_balance - before_balance
             if received <= 0:
-                received = expected  # 잔고 조회 실패 시 예상값 사용
+                received = expected
             logging.info(f"[{pubkey[:8]}] 매수 성공 — {received} raw token 수령")
 
         logging.info(f"[{pubkey[:8]}] 매수 결과: {'성공' if ok else '실패'} sig={sig}")
@@ -288,8 +289,6 @@ def buy_token(keypair: Keypair, multiplier: float = 1.0):
         return None, False, str(e)[:100], 0
 
 # ─── 매도 (TOKEN → SOL) ───────────────────────────────────────────
-# received_amount: 직전 매수에서 받은 토큰량
-# 매도량 = 매수량의 91~100% 랜덤 (매수량과 같거나 최대 10% 적게)
 def sell_token(keypair: Keypair, received_amount: int = 0, multiplier: float = 1.0):
     try:
         pubkey  = str(keypair.pubkey())
@@ -299,15 +298,13 @@ def sell_token(keypair: Keypair, received_amount: int = 0, multiplier: float = 1
             return None, False, "토큰 잔액없음"
 
         if received_amount > 0:
-            # 매수량의 90~100% 랜덤 매도 (10% 이내로 적게)
             sell_ratio = random.uniform(0.90, 1.00)
             amount_in  = min(int(received_amount * sell_ratio * multiplier), balance)
             logging.info(f"[{pubkey[:8]}] 매도 비율: {sell_ratio:.2%} of {received_amount}")
         else:
-            # fallback: 잔고의 1% 소량 매도
             amount_in = max(1, int(balance * 0.01))
 
-        amount_in = min(amount_in, balance)  # 잔고 초과 방지
+        amount_in = min(amount_in, balance)
 
         if amount_in == 0:
             return None, False, "매도량 0"
@@ -342,13 +339,11 @@ def interruptible_sleep(seconds: int) -> bool:
     return True
 
 # ─── 메인 지갑 루프 ───────────────────────────────────────────────
-# 즉시 매수 → 매수 2회마다 매도 1회 → 45~75분 간격
-# 매도 시 직전 매수에서 받은 토큰량만 매도 (풀 균형 유지)
 def main_wallet_loop(keypair: Keypair):
     label          = "메인"
     buy_count      = 0
     fail_count     = 0
-    pending_tokens = 0  # 누적 미매도 토큰량
+    pending_tokens = 0
     logging.info(f"[{label}] 거래 루프 시작 — 즉시 첫 매수 (매수2:매도1)")
 
     while is_trading():
@@ -369,7 +364,6 @@ def main_wallet_loop(keypair: Keypair):
                 else:
                     fail_count += 1
             else:
-                # 2회 매수에서 받은 토큰 매도
                 sig, ok, info = sell_token(keypair, received_amount=pending_tokens)
                 log_trade(label, "매도", sig, ok, info)
                 if ok:
@@ -406,7 +400,7 @@ def wallet1_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0):
 
     buy_count      = 0
     fail_count     = 0
-    pending_tokens = 0  # 누적 미매도 토큰량
+    pending_tokens = 0
 
     while is_trading():
         try:
@@ -427,7 +421,6 @@ def wallet1_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0):
                 else:
                     fail_count += 1
             else:
-                # 매수 2회 누적 토큰 매도
                 sig, ok, info = sell_token(keypair, received_amount=pending_tokens, multiplier=multiplier)
                 log_trade(wallet_label, "매도", sig, ok, info)
                 if ok:
@@ -457,8 +450,6 @@ def wallet1_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0):
             time.sleep(60)
 
 # ─── 추가 지갑 루프 ───────────────────────────────────────────────
-# 초기 랜덤 딜레이 후 하루 4~5회, 매수/매도 번갈아
-# 매도 시 직전 매수에서 받은 토큰량만 매도
 def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0):
     initial_delay = random.randint(0, 6 * 3600)
     logging.info(f"[{wallet_label}] 거래 루프 시작 — 초기 대기 {initial_delay//60}분")
@@ -467,7 +458,7 @@ def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1
 
     next_action    = "buy"
     fail_count     = 0
-    last_received  = 0  # 직전 매수에서 받은 토큰량
+    last_received  = 0
 
     while is_trading():
         try:
@@ -487,7 +478,6 @@ def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1
                 else:
                     fail_count += 1
             else:
-                # 직전 매수에서 받은 토큰만 매도
                 sig, ok, info = sell_token(keypair, received_amount=last_received, multiplier=multiplier)
                 log_trade(wallet_label, "매도", sig, ok, info)
                 if ok:
@@ -517,14 +507,21 @@ def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1
 
 # ─── 하루 2회 보고 스케줄러 ───────────────────────────────────────
 def daily_report_loop(chat_id):
-    async def send_report():
-        async with Bot(token=TELEGRAM_TOKEN) as bot:
-            if not daily_log:
-                msg = "📊 일일 리포트\n오늘 거래 내역이 없습니다."
-            else:
-                msg = f"📊 일일 리포트 ({len(daily_log)}건)\n\n" + "\n".join(daily_log[-50:])
-            await bot.send_message(chat_id=chat_id, text=msg[:4000])
-            daily_log.clear()
+    def send_report():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        async def _inner():
+            async with Bot(token=TELEGRAM_TOKEN) as bot:
+                if not daily_log:
+                    msg = "📊 일일 리포트\n오늘 거래 내역이 없습니다."
+                else:
+                    msg = f"📊 일일 리포트 ({len(daily_log)}건)\n\n" + "\n".join(daily_log[-50:])
+                await bot.send_message(chat_id=chat_id, text=msg[:4000])
+                daily_log.clear()
+        try:
+            loop.run_until_complete(_inner())
+        finally:
+            loop.close()
 
     while is_trading():
         now          = datetime.now()
@@ -541,7 +538,7 @@ def daily_report_loop(chat_id):
 
         now2 = datetime.now()
         if now2.hour in target_hours and now2.minute < 5:
-            asyncio.run(send_report())
+            send_report()
             time.sleep(300)
 
 # ─── 텔레그램 핸들러 ──────────────────────────────────────────────
@@ -588,7 +585,7 @@ async def handle_update(update_data):
                 return
 
             set_trading(True)
-            alert_chat_id  = chat_id
+            alert_chat_id   = chat_id
             trading_threads = []
 
             t_main = threading.Thread(target=main_wallet_loop, args=(BOT_KEYPAIR,), daemon=True)
@@ -602,8 +599,7 @@ async def handle_update(update_data):
                 kp    = parse_keypair(key)
                 mult  = LARGE_WALLET_MULTIPLIER if idx == LARGE_WALLET_INDEX else 1.0
                 label = f"지갑{idx}" + (" (대형)" if mult > 1.0 else "")
-                target = extra_wallet_loop
-                t = threading.Thread(target=target, args=(kp, label, mult), daemon=True)
+                t = threading.Thread(target=extra_wallet_loop, args=(kp, label, mult), daemon=True)
                 t.start()
                 trading_threads.append(t)
 
@@ -690,33 +686,79 @@ def _run_in_thread(data):
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(handle_update(data))
+    except Exception as e:
+        logging.error(f"handle_update 오류: {e}", exc_info=True)
     finally:
         loop.close()
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(force=True)
+    logging.info(f"webhook 수신: {str(data)[:200]}")
     t = threading.Thread(target=_run_in_thread, args=(data,), daemon=True)
     t.start()
     return "OK"
 
 @app.route("/set_webhook")
 def set_webhook():
-    import httpx as _httpx
+    target_url = f"{WEBHOOK_URL}/webhook"
+    logging.info(f"웹훅 등록 시도: {target_url}")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def _set():
+        async with Bot(token=TELEGRAM_TOKEN) as bot:
+            result = await bot.set_webhook(
+                target_url,
+                allowed_updates=["message", "callback_query"],
+            )
+            info = await bot.get_webhook_info()
+            return result, info
+
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
-        resp = _httpx.post(url, json={"url": f"{WEBHOOK_URL}/webhook"}, timeout=30)
-        data = resp.json()
-        if data.get("ok"):
-            return f"✅ Webhook set to {WEBHOOK_URL}/webhook"
-        else:
-            return f"❌ 실패: {data}", 500
+        result, info = loop.run_until_complete(_set())
+        loop.close()
+        last_err = info.last_error_message or "없음"
+        return (
+            f"✅ Webhook 등록 완료: {result}<br><br>"
+            f"등록 URL: {info.url}<br>"
+            f"대기 업데이트: {info.pending_update_count}<br>"
+            f"마지막 오류: {last_err}"
+        )
     except Exception as e:
-        return f"❌ 오류: {e}", 500
+        loop.close()
+        logging.error(f"웹훅 등록 실패: {e}", exc_info=True)
+        return f"❌ 웹훅 등록 실패: {str(e)}", 500
+
+@app.route("/webhook_info")
+def webhook_info():
+    """현재 웹훅 상태 확인용 엔드포인트"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def _info():
+        async with Bot(token=TELEGRAM_TOKEN) as bot:
+            return await bot.get_webhook_info()
+
+    try:
+        info = loop.run_until_complete(_info())
+        loop.close()
+        return (
+            f"📡 Webhook 상태<br><br>"
+            f"URL: {info.url}<br>"
+            f"대기 업데이트: {info.pending_update_count}<br>"
+            f"마지막 오류: {info.last_error_message or '없음'}<br>"
+            f"마지막 오류 시각: {info.last_error_date or '없음'}"
+        )
+    except Exception as e:
+        loop.close()
+        return f"❌ 조회 실패: {str(e)}", 500
 
 @app.route("/")
 def index():
-    return "Bot is running! 🚀"
+    status = "🟢 거래 중" if is_trading() else "🔴 거래 중지"
+    return f"Bot is running! 🚀<br>거래 상태: {status}<br><a href='/set_webhook'>웹훅 등록</a> | <a href='/webhook_info'>웹훅 상태 확인</a>"
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
