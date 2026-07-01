@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 # ─── 환경변수 ─────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY    = os.environ["GROQ_API_KEY"]
-WEBHOOK_URL     = os.environ["WEBHOOK_URL"].rstrip("/")  # 끝 슬래시 제거
+WEBHOOK_URL     = os.environ["WEBHOOK_URL"].rstrip("/")
 TAVILY_API_KEY  = os.environ["TAVILY_API_KEY"]
 
 RPC_URL         = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -53,12 +53,12 @@ JUPITER_SWAP_ENDPOINTS = [
     "https://quote-api.jup.ag/v6/swap",
 ]
 
-# ─── 안전 설정 ────────────────────────────────────────────────────
-MIN_SOL            = 0.001
-MAX_SOL            = 0.003
-SLIPPAGE_BPS       = 50
-PRIORITY_FEE_MICRO = 50000
-TOKEN_DECIMALS     = 6
+# ─── 환경변수로 관리되는 설정 ─────────────────────────────────────
+MIN_SOL            = float(os.environ.get("MIN_SOL", "0.0005"))
+MAX_SOL            = float(os.environ.get("MAX_SOL", "0.001"))
+SLIPPAGE_BPS       = int(os.environ.get("SLIPPAGE_BPS", "30"))
+PRIORITY_FEE_MICRO = int(os.environ.get("PRIORITY_FEE_MICRO", "5000"))
+TOKEN_DECIMALS     = int(os.environ.get("TOKEN_DECIMALS", "6"))
 
 # ─── 스레드 안전 상태 관리 ────────────────────────────────────────
 _state_lock           = threading.Lock()
@@ -391,64 +391,6 @@ def main_wallet_loop(keypair: Keypair):
                 return
             time.sleep(60)
 
-# ─── 지갑1 전용 루프 (매수2:매도1) ──────────────────────────────
-def wallet1_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0):
-    initial_delay = random.randint(0, 6 * 3600)
-    logging.info(f"[{wallet_label}] 거래 루프 시작 — 초기 대기 {initial_delay//60}분 (매수2:매도1)")
-    if not interruptible_sleep(initial_delay):
-        return
-
-    buy_count      = 0
-    fail_count     = 0
-    pending_tokens = 0
-
-    while is_trading():
-        try:
-            sol_bal = get_sol_balance(str(keypair.pubkey()))
-            if sol_bal < 0.002:
-                logging.warning(f"[{wallet_label}] SOL 잔액 부족 ({sol_bal:.4f}) — 거래 중단")
-                daily_log.append(f"⚠️ [{wallet_label}] SOL 부족으로 거래 중단")
-                return
-
-            if buy_count < 2:
-                sig, ok, info, received = buy_token(keypair, multiplier)
-                log_trade(wallet_label, "매수", sig, ok, info)
-                if ok:
-                    buy_count      += 1
-                    fail_count      = 0
-                    pending_tokens += received
-                    logging.info(f"[{wallet_label}] 매수 {buy_count}/2")
-                else:
-                    fail_count += 1
-            else:
-                sig, ok, info = sell_token(keypair, received_amount=pending_tokens, multiplier=multiplier)
-                log_trade(wallet_label, "매도", sig, ok, info)
-                if ok:
-                    buy_count      = 0
-                    fail_count     = 0
-                    pending_tokens = 0
-                    logging.info(f"[{wallet_label}] 매도 완료 — 카운트 초기화")
-                else:
-                    fail_count += 1
-
-            if fail_count >= MAX_CONSECUTIVE_FAILS:
-                logging.warning(f"[{wallet_label}] 연속 {fail_count}회 실패 — 거래 중단")
-                daily_log.append(f"⚠️ [{wallet_label}] 연속 {fail_count}회 실패로 거래 중단")
-                return
-
-            wait = random.randint(240 * 60, 360 * 60)
-            logging.info(f"[{wallet_label}] 다음 거래까지 {wait//60}분 대기")
-            if not interruptible_sleep(wait):
-                return
-
-        except Exception as e:
-            fail_count += 1
-            logging.error(f"[{wallet_label}] 루프 오류 ({fail_count}/{MAX_CONSECUTIVE_FAILS}): {e}", exc_info=True)
-            if fail_count >= MAX_CONSECUTIVE_FAILS:
-                logging.warning(f"[{wallet_label}] 연속 오류로 거래 중단")
-                return
-            time.sleep(60)
-
 # ─── 추가 지갑 루프 ───────────────────────────────────────────────
 def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0):
     initial_delay = random.randint(0, 6 * 3600)
@@ -456,9 +398,9 @@ def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1
     if not interruptible_sleep(initial_delay):
         return
 
-    next_action    = "buy"
-    fail_count     = 0
-    last_received  = 0
+    next_action   = "buy"
+    fail_count    = 0
+    last_received = 0
 
     while is_trading():
         try:
@@ -562,6 +504,7 @@ async def handle_update(update_data):
                 "/stoptrading  - 자동거래 중지\n"
                 "/balance      - 전체 지갑 잔액 확인\n"
                 "/report       - 지금까지 거래 로그 확인\n"
+                "/settings     - 현재 설정값 확인\n"
                 "/reset        - 대화 초기화"
             ))
             return
@@ -569,6 +512,20 @@ async def handle_update(update_data):
         if user_text == "/reset":
             conversation_history[user_id] = []
             await bot.send_message(chat_id=chat_id, text="대화 기록이 초기화되었습니다.")
+            return
+
+        if user_text == "/settings":
+            await bot.send_message(chat_id=chat_id, text=(
+                f"⚙️ 현재 설정값\n\n"
+                f"TOKEN_MINT: {TOKEN_MINT}\n"
+                f"TOKEN_DECIMALS: {TOKEN_DECIMALS}\n"
+                f"MIN_SOL: {MIN_SOL}\n"
+                f"MAX_SOL: {MAX_SOL}\n"
+                f"SLIPPAGE_BPS: {SLIPPAGE_BPS} ({SLIPPAGE_BPS/100:.1f}%)\n"
+                f"PRIORITY_FEE_MICRO: {PRIORITY_FEE_MICRO}\n"
+                f"추가 지갑 수: {len(EXTRA_WALLET_KEYS)}개\n"
+                f"거래 제외 지갑: {EXCLUDE_WALLET_INDEXES}"
+            ))
             return
 
         if user_text == "/report":
@@ -610,11 +567,12 @@ async def handle_update(update_data):
                 chat_id=chat_id,
                 text=(
                     f"✅ 자동거래 시작!\n\n"
+                    f"📌 토큰: {TOKEN_MINT[:8]}...\n"
                     f"📌 거래량: {MIN_SOL}~{MAX_SOL} SOL\n"
                     f"📌 슬리피지: {SLIPPAGE_BPS/100:.1f}%\n"
+                    f"📌 우선순위 수수료: {PRIORITY_FEE_MICRO} micro lamports\n"
                     f"📌 메인: 매수2:매도1, 45~75분 간격\n"
-                    f"📌 추가 지갑 {len(EXTRA_WALLET_KEYS)}개: 매수1:매도1, 하루 4~5회\n"
-                    f"📌 매도량: 직전 매수에서 받은 토큰량만 매도 (풀 균형 유지)\n"
+                    f"📌 추가 지갑 {len(EXTRA_WALLET_KEYS)}개: 매수1:매도1, 4~6시간 간격\n"
                     f"📌 연속 {MAX_CONSECUTIVE_FAILS}회 실패 시 자동 중지\n\n"
                     f"📊 리포트: 매일 오전9시/오후9시"
                 )
@@ -733,7 +691,6 @@ def set_webhook():
 
 @app.route("/webhook_info")
 def webhook_info():
-    """현재 웹훅 상태 확인용 엔드포인트"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -758,7 +715,12 @@ def webhook_info():
 @app.route("/")
 def index():
     status = "🟢 거래 중" if is_trading() else "🔴 거래 중지"
-    return f"Bot is running! 🚀<br>거래 상태: {status}<br><a href='/set_webhook'>웹훅 등록</a> | <a href='/webhook_info'>웹훅 상태 확인</a>"
+    return (
+        f"Bot is running! 🚀<br>"
+        f"거래 상태: {status}<br><br>"
+        f"<a href='/set_webhook'>웹훅 등록</a> | "
+        f"<a href='/webhook_info'>웹훅 상태 확인</a>"
+    )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
