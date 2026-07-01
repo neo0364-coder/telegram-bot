@@ -58,7 +58,7 @@ MIN_SOL            = 0.001
 MAX_SOL            = 0.003
 SLIPPAGE_BPS       = 50
 PRIORITY_FEE_MICRO = 50000
-TOKEN_DECIMALS     = 9
+TOKEN_DECIMALS     = 6
 
 # ─── 스레드 안전 상태 관리 ────────────────────────────────────────
 _state_lock           = threading.Lock()
