@@ -467,7 +467,7 @@ def daily_report_loop(chat_id):
 
     while is_trading():
         now          = datetime.now()
-        target_hours = [9, 21]
+        target_hours = [9, 13, 17, 21, 1]
         next_hour    = next((h for h in target_hours if h > now.hour), None)
         if next_hour:
             wait = (next_hour - now.hour) * 3600 - now.minute * 60
