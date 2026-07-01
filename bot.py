@@ -29,7 +29,7 @@ TAVILY_API_KEY  = os.environ["TAVILY_API_KEY"]
 
 RPC_URL         = os.environ.get("RPC_URL", "https://api.mainnet-beta.solana.com")
 BOT_PRIVATE_KEY = os.environ["BOT_PRIVATE_KEY2"]
-TOKEN_MINT      = os.environ.get("TOKEN_MINT", "Hma4KPrjv5skxgDjkNHMAAyDHEqx1bw2tS5aok2qBBgs")
+TOKEN_MINT      = os.environ.get("TOKEN_MINT", "HjaXEmHxwWh42nA9vYb5rDmtviNFompy3nn1zpSh4wvK")
 
 EXTRA_WALLET_KEYS = []
 for i in range(1, 11):
