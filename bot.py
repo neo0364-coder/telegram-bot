@@ -41,6 +41,10 @@ LARGE_WALLET_INDEX      = 5
 EXCLUDE_WALLET_INDEXES  = [4]
 LARGE_WALLET_MULTIPLIER = 1.5
 
+# ─── 지갑1 전용 거래 간격 (2시간 근처 랜덤, ±20분) ─────────────────
+WALLET1_WAIT_MIN_SEC = 100 * 60   # 100분
+WALLET1_WAIT_MAX_SEC = 140 * 60   # 140분
+
 # ─── Jupiter API (메인 + 폴백) ────────────────────────────────────
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
@@ -392,7 +396,10 @@ def main_wallet_loop(keypair: Keypair):
             time.sleep(60)
 
 # ─── 추가 지갑 루프 ───────────────────────────────────────────────
-def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0):
+# wait_min_sec / wait_max_sec 을 지정하면 해당 지갑만 다른 거래 간격을 쓸 수 있음
+# (기본값은 기존과 동일한 4~6시간)
+def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1.0,
+                       wait_min_sec: int = 240 * 60, wait_max_sec: int = 360 * 60):
     initial_delay = random.randint(0, 6 * 3600)
     logging.info(f"[{wallet_label}] 거래 루프 시작 — 초기 대기 {initial_delay//60}분")
     if not interruptible_sleep(initial_delay):
@@ -434,7 +441,7 @@ def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1
                 daily_log.append(f"⚠️ [{wallet_label}] 연속 {fail_count}회 실패로 거래 중단")
                 return
 
-            wait = random.randint(240 * 60, 360 * 60)
+            wait = random.randint(wait_min_sec, wait_max_sec)
             logging.info(f"[{wallet_label}] 다음 거래까지 {wait//60}분 대기")
             if not interruptible_sleep(wait):
                 return
@@ -447,7 +454,7 @@ def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1
                 return
             time.sleep(60)
 
-# ─── 하루 2회 보고 스케줄러 ───────────────────────────────────────
+# ─── 하루 5회 보고 스케줄러 ───────────────────────────────────────
 def daily_report_loop(chat_id):
     def send_report():
         loop = asyncio.new_event_loop()
@@ -467,7 +474,8 @@ def daily_report_loop(chat_id):
 
     while is_trading():
         now          = datetime.now()
-        target_hours = [9, 13, 17, 21, 1]
+        # 오름차순 정렬 필수 (wrap-around 계산 로직이 정렬을 전제로 함)
+        target_hours = [1, 9, 13, 17, 21]
         next_hour    = next((h for h in target_hours if h > now.hour), None)
         if next_hour:
             wait = (next_hour - now.hour) * 3600 - now.minute * 60
@@ -556,7 +564,17 @@ async def handle_update(update_data):
                 kp    = parse_keypair(key)
                 mult  = LARGE_WALLET_MULTIPLIER if idx == LARGE_WALLET_INDEX else 1.0
                 label = f"지갑{idx}" + (" (대형)" if mult > 1.0 else "")
-                t = threading.Thread(target=extra_wallet_loop, args=(kp, label, mult), daemon=True)
+
+                if idx == 1:
+                    # 지갑1: 2시간 근처 랜덤 간격 (100~140분)
+                    t = threading.Thread(
+                        target=extra_wallet_loop,
+                        args=(kp, label, mult, WALLET1_WAIT_MIN_SEC, WALLET1_WAIT_MAX_SEC),
+                        daemon=True
+                    )
+                else:
+                    t = threading.Thread(target=extra_wallet_loop, args=(kp, label, mult), daemon=True)
+
                 t.start()
                 trading_threads.append(t)
 
@@ -572,9 +590,10 @@ async def handle_update(update_data):
                     f"📌 슬리피지: {SLIPPAGE_BPS/100:.1f}%\n"
                     f"📌 우선순위 수수료: {PRIORITY_FEE_MICRO} micro lamports\n"
                     f"📌 메인: 매수2:매도1, 45~75분 간격\n"
-                    f"📌 추가 지갑 {len(EXTRA_WALLET_KEYS)}개: 매수1:매도1, 4~6시간 간격\n"
+                    f"📌 지갑1: 매수1:매도1, 100~140분(약 2시간) 간격\n"
+                    f"📌 그 외 추가 지갑: 매수1:매도1, 4~6시간 간격\n"
                     f"📌 연속 {MAX_CONSECUTIVE_FAILS}회 실패 시 자동 중지\n\n"
-                    f"📊 리포트: 매일 오전9시/오후9시"
+                    f"📊 리포트: 매일 01/09/13/17/21시"
                 )
             )
             return
