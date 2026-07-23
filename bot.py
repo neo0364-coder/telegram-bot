@@ -7,6 +7,7 @@ import threading
 import time
 import base64
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, request
 from telegram import Update, Bot
 from groq import Groq
@@ -20,6 +21,9 @@ from solders.message import to_bytes_versioned
 import httpx
 
 logging.basicConfig(level=logging.INFO)
+
+# ─── 타임존 ────────────────────────────────────────────────────────
+KST = ZoneInfo("Asia/Seoul")
 
 # ─── 환경변수 ─────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
@@ -48,14 +52,24 @@ WALLET1_WAIT_MAX_SEC = 140 * 60   # 140분
 # ─── Jupiter API (메인 + 폴백) ────────────────────────────────────
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
+# API 키는 반드시 환경변수로 관리 (Railway Variables에 JUPITER_API_KEY로 등록)
+JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY", "")
+JUPITER_HEADERS = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
+
+# api.jup.ag(유료/키 인증) 우선, lite-api.jup.ag(무료/레거시)를 폴백으로 사용
+# quote-api.jup.ag/v6 는 폐기(deprecated)되어 DNS 조회 자체가 실패하므로 제거
 JUPITER_QUOTE_ENDPOINTS = [
+    "https://api.jup.ag/swap/v1/quote",
     "https://lite-api.jup.ag/swap/v1/quote",
-    "https://quote-api.jup.ag/v6/quote",
 ]
 JUPITER_SWAP_ENDPOINTS = [
+    "https://api.jup.ag/swap/v1/swap",
     "https://lite-api.jup.ag/swap/v1/swap",
-    "https://quote-api.jup.ag/v6/swap",
 ]
+
+# 토큰이 방금 막 인덱싱되었거나 일시적으로 라우팅에서 빠진 경우를 대비한 재시도 설정
+NOT_TRADABLE_RETRY_COUNT = 2
+NOT_TRADABLE_RETRY_WAIT_SEC = 15
 
 # ─── 환경변수로 관리되는 설정 ─────────────────────────────────────
 MIN_SOL            = float(os.environ.get("MIN_SOL", "0.0005"))
@@ -176,31 +190,51 @@ def confirm_transaction(sig: str, timeout: int = 60) -> bool:
         time.sleep(2)
     return False
 
-# ─── Jupiter Quote (재시도 + 폴백) ───────────────────────────────
+# ─── Jupiter Quote (재시도 + 폴백 + TOKEN_NOT_TRADABLE 재시도) ────
 def jupiter_quote(input_mint: str, output_mint: str, amount_lamports: int) -> dict:
     last_exc = None
     for url in JUPITER_QUOTE_ENDPOINTS:
-        for attempt in range(3):
-            try:
-                resp = httpx.get(url, params={
-                    "inputMint":           input_mint,
-                    "outputMint":          output_mint,
-                    "amount":              amount_lamports,
-                    "slippageBps":         SLIPPAGE_BPS,
-                    "onlyDirectRoutes":    "false",
-                    "asLegacyTransaction": "false",
-                }, timeout=15)
-                logging.info(f"Jupiter quote [{url}] 응답: {resp.status_code} {resp.text[:300]}")
-                resp.raise_for_status()
-                return resp.json()
-            except (httpx.ConnectError, httpx.TimeoutException) as e:
-                last_exc = e
-                logging.warning(f"Jupiter quote 실패 [{url}] ({attempt+1}/3): {e}")
-                time.sleep(5 * (attempt + 1))
-            except httpx.HTTPStatusError as e:
-                last_exc = e
-                logging.warning(f"Jupiter quote HTTP 오류 [{url}]: {e}")
+        not_tradable_attempt = 0
+        while not_tradable_attempt <= NOT_TRADABLE_RETRY_COUNT:
+            got_not_tradable = False
+            for attempt in range(3):
+                try:
+                    resp = httpx.get(url, params={
+                        "inputMint":           input_mint,
+                        "outputMint":          output_mint,
+                        "amount":              amount_lamports,
+                        "slippageBps":         SLIPPAGE_BPS,
+                        "onlyDirectRoutes":    "false",
+                        "asLegacyTransaction": "false",
+                    }, headers=JUPITER_HEADERS, timeout=15)
+                    logging.info(f"Jupiter quote [{url}] 응답: {resp.status_code} {resp.text[:300]}")
+                    resp.raise_for_status()
+                    return resp.json()
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    last_exc = e
+                    logging.warning(f"Jupiter quote 실패 [{url}] ({attempt+1}/3): {e}")
+                    time.sleep(5 * (attempt + 1))
+                except httpx.HTTPStatusError as e:
+                    last_exc = e
+                    # TOKEN_NOT_TRADABLE은 신규/저유동성 토큰의 인덱싱 지연으로
+                    # 일시적으로만 발생하는 경우가 있어, 짧게 대기 후 같은 엔드포인트로 재시도
+                    if e.response.status_code == 400 and "TOKEN_NOT_TRADABLE" in e.response.text:
+                        got_not_tradable = True
+                        logging.warning(
+                            f"Jupiter quote TOKEN_NOT_TRADABLE [{url}] "
+                            f"(재시도 {not_tradable_attempt+1}/{NOT_TRADABLE_RETRY_COUNT+1}): {e}"
+                        )
+                    else:
+                        logging.warning(f"Jupiter quote HTTP 오류 [{url}]: {e}")
+                    break  # attempt 루프는 즉시 종료 (재시도는 바깥 while에서 처리)
+
+            if not got_not_tradable:
+                # TOKEN_NOT_TRADABLE이 아닌 실패(네트워크 오류/기타 HTTP 오류)는
+                # 이 엔드포인트를 더 시도해도 소용없으므로 다음 URL로 넘어감
                 break
+            not_tradable_attempt += 1
+            if not_tradable_attempt <= NOT_TRADABLE_RETRY_COUNT:
+                time.sleep(NOT_TRADABLE_RETRY_WAIT_SEC)
     raise RuntimeError(f"Jupiter quote 모든 엔드포인트 실패: {last_exc}")
 
 # ─── Jupiter Swap (재시도 + 폴백) ────────────────────────────────
@@ -215,7 +249,7 @@ def jupiter_swap_tx(quote: dict, user_pubkey: str) -> str:
                     "wrapAndUnwrapSol":          True,
                     "prioritizationFeeLamports": PRIORITY_FEE_MICRO,
                     "dynamicComputeUnitLimit":   True,
-                }, timeout=15)
+                }, headers=JUPITER_HEADERS, timeout=15)
                 logging.info(f"Jupiter swap [{url}] 응답: {resp.status_code} {resp.text[:300]}")
                 resp.raise_for_status()
                 return resp.json()["swapTransaction"]
@@ -328,7 +362,7 @@ def sell_token(keypair: Keypair, received_amount: int = 0, multiplier: float = 1
 
 # ─── 로그 기록 헬퍼 ──────────────────────────────────────────────
 def log_trade(label: str, action: str, sig, ok: bool, info: str):
-    ts  = datetime.now().strftime("%H:%M")
+    ts  = datetime.now(KST).strftime("%H:%M")
     tag = "✅" if ok else "❌"
     daily_log.append(f"{tag} [{label}] {ts} {action} {info}")
     if sig:
@@ -457,23 +491,27 @@ def extra_wallet_loop(keypair: Keypair, wallet_label: str, multiplier: float = 1
 # ─── 하루 5회 보고 스케줄러 ───────────────────────────────────────
 def daily_report_loop(chat_id):
     def send_report():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        async def _inner():
-            async with Bot(token=TELEGRAM_TOKEN) as bot:
-                if not daily_log:
-                    msg = "📊 일일 리포트\n오늘 거래 내역이 없습니다."
-                else:
-                    msg = f"📊 일일 리포트 ({len(daily_log)}건)\n\n" + "\n".join(daily_log[-50:])
-                await bot.send_message(chat_id=chat_id, text=msg[:4000])
-                daily_log.clear()
         try:
-            loop.run_until_complete(_inner())
-        finally:
-            loop.close()
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            async def _inner():
+                async with Bot(token=TELEGRAM_TOKEN) as bot:
+                    if not daily_log:
+                        msg = "📊 일일 리포트\n오늘 거래 내역이 없습니다."
+                    else:
+                        msg = f"📊 일일 리포트 ({len(daily_log)}건)\n\n" + "\n".join(daily_log[-50:])
+                    await bot.send_message(chat_id=chat_id, text=msg[:4000])
+                    daily_log.clear()
+            try:
+                loop.run_until_complete(_inner())
+            finally:
+                loop.close()
+        except Exception as e:
+            # 리포트 전송이 실패해도 스케줄러 루프 자체는 죽지 않도록 여기서 잡아준다
+            logging.error(f"[daily_report_loop] 리포트 전송 실패: {e}", exc_info=True)
 
     while is_trading():
-        now          = datetime.now()
+        now          = datetime.now(KST)
         # 오름차순 정렬 필수 (wrap-around 계산 로직이 정렬을 전제로 함)
         target_hours = [1, 9, 13, 17, 21]
         next_hour    = next((h for h in target_hours if h > now.hour), None)
@@ -486,7 +524,7 @@ def daily_report_loop(chat_id):
         if not interruptible_sleep(min(wait, 3600)):
             return
 
-        now2 = datetime.now()
+        now2 = datetime.now(KST)
         if now2.hour in target_hours and now2.minute < 5:
             send_report()
             time.sleep(300)
