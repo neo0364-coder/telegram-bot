@@ -49,22 +49,24 @@ LARGE_WALLET_MULTIPLIER = 1.5
 WALLET1_WAIT_MIN_SEC = 100 * 60   # 100분
 WALLET1_WAIT_MAX_SEC = 140 * 60   # 140분
 
-# ─── Jupiter API (메인 + 폴백) ────────────────────────────────────
+# ─── Jupiter Ultra API (jup.ag 웹사이트가 실제로 사용하는 엔진) ──────
+# 기존 swap/v1 (Metis 라우팅 엔진)은 신규/저유동성 토큰에 대해 TOKEN_NOT_TRADABLE을
+# 반환하는 인덱싱 지연 문제가 있음. Ultra API는 "Just-In-Time Market Revival" 기능으로
+# 이런 마켓을 동적으로 재인덱싱하므로 jup.ag 웹사이트에서는 거래가 가능했던 것.
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 # API 키는 반드시 환경변수로 관리 (Railway Variables에 JUPITER_API_KEY로 등록)
 JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY", "")
 JUPITER_HEADERS = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
 
-# api.jup.ag(유료/키 인증) 우선, lite-api.jup.ag(무료/레거시)를 폴백으로 사용
-# quote-api.jup.ag/v6 는 폐기(deprecated)되어 DNS 조회 자체가 실패하므로 제거
-JUPITER_QUOTE_ENDPOINTS = [
-    "https://api.jup.ag/swap/v1/quote",
-    "https://lite-api.jup.ag/swap/v1/quote",
+# api.jup.ag(키 인증) 우선, lite-api.jup.ag(무료 티어)를 폴백으로 사용
+JUPITER_ORDER_ENDPOINTS = [
+    "https://api.jup.ag/ultra/v1/order",
+    "https://lite-api.jup.ag/ultra/v1/order",
 ]
-JUPITER_SWAP_ENDPOINTS = [
-    "https://api.jup.ag/swap/v1/swap",
-    "https://lite-api.jup.ag/swap/v1/swap",
+JUPITER_EXECUTE_ENDPOINTS = [
+    "https://api.jup.ag/ultra/v1/execute",
+    "https://lite-api.jup.ag/ultra/v1/execute",
 ]
 
 # 토큰이 방금 막 인덱싱되었거나 일시적으로 라우팅에서 빠진 경우를 대비한 재시도 설정
@@ -190,81 +192,82 @@ def confirm_transaction(sig: str, timeout: int = 60) -> bool:
         time.sleep(2)
     return False
 
-# ─── Jupiter Quote (재시도 + 폴백 + TOKEN_NOT_TRADABLE 재시도) ────
-def jupiter_quote(input_mint: str, output_mint: str, amount_lamports: int) -> dict:
+# ─── Jupiter Ultra: Order 요청 (quote+tx 생성이 한 번에 처리됨) ───
+def jupiter_ultra_order(input_mint: str, output_mint: str, amount_lamports: int, taker_pubkey: str) -> dict:
     last_exc = None
-    for url in JUPITER_QUOTE_ENDPOINTS:
+    for url in JUPITER_ORDER_ENDPOINTS:
         not_tradable_attempt = 0
         while not_tradable_attempt <= NOT_TRADABLE_RETRY_COUNT:
             got_not_tradable = False
             for attempt in range(3):
                 try:
                     resp = httpx.get(url, params={
-                        "inputMint":           input_mint,
-                        "outputMint":          output_mint,
-                        "amount":              amount_lamports,
-                        "slippageBps":         SLIPPAGE_BPS,
-                        "onlyDirectRoutes":    "false",
-                        "asLegacyTransaction": "false",
+                        "inputMint":  input_mint,
+                        "outputMint": output_mint,
+                        "amount":     amount_lamports,
+                        "taker":      taker_pubkey,
                     }, headers=JUPITER_HEADERS, timeout=15)
-                    logging.info(f"Jupiter quote [{url}] 응답: {resp.status_code} {resp.text[:300]}")
+                    logging.info(f"Jupiter order [{url}] 응답: {resp.status_code} {resp.text[:300]}")
                     resp.raise_for_status()
-                    return resp.json()
+                    data = resp.json()
+                    # transaction이 null이면 라우팅 가능한 경로가 없다는 뜻 (구버전 TOKEN_NOT_TRADABLE과 동일 취급)
+                    if not data.get("transaction"):
+                        got_not_tradable = True
+                        last_exc = RuntimeError(f"Ultra order: no route/transaction returned ({data.get('errorMessage', data)})")
+                        logging.warning(
+                            f"Jupiter order 라우팅 경로 없음 [{url}] "
+                            f"(재시도 {not_tradable_attempt+1}/{NOT_TRADABLE_RETRY_COUNT+1})"
+                        )
+                        break
+                    return data
                 except (httpx.ConnectError, httpx.TimeoutException) as e:
                     last_exc = e
-                    logging.warning(f"Jupiter quote 실패 [{url}] ({attempt+1}/3): {e}")
+                    logging.warning(f"Jupiter order 실패 [{url}] ({attempt+1}/3): {e}")
                     time.sleep(5 * (attempt + 1))
                 except httpx.HTTPStatusError as e:
                     last_exc = e
-                    # TOKEN_NOT_TRADABLE은 신규/저유동성 토큰의 인덱싱 지연으로
-                    # 일시적으로만 발생하는 경우가 있어, 짧게 대기 후 같은 엔드포인트로 재시도
                     if e.response.status_code == 400 and "TOKEN_NOT_TRADABLE" in e.response.text:
                         got_not_tradable = True
                         logging.warning(
-                            f"Jupiter quote TOKEN_NOT_TRADABLE [{url}] "
+                            f"Jupiter order TOKEN_NOT_TRADABLE [{url}] "
                             f"(재시도 {not_tradable_attempt+1}/{NOT_TRADABLE_RETRY_COUNT+1}): {e}"
                         )
                     else:
-                        logging.warning(f"Jupiter quote HTTP 오류 [{url}]: {e}")
-                    break  # attempt 루프는 즉시 종료 (재시도는 바깥 while에서 처리)
+                        logging.warning(f"Jupiter order HTTP 오류 [{url}]: {e}")
+                    break
 
             if not got_not_tradable:
-                # TOKEN_NOT_TRADABLE이 아닌 실패(네트워크 오류/기타 HTTP 오류)는
-                # 이 엔드포인트를 더 시도해도 소용없으므로 다음 URL로 넘어감
                 break
             not_tradable_attempt += 1
             if not_tradable_attempt <= NOT_TRADABLE_RETRY_COUNT:
                 time.sleep(NOT_TRADABLE_RETRY_WAIT_SEC)
-    raise RuntimeError(f"Jupiter quote 모든 엔드포인트 실패: {last_exc}")
+    raise RuntimeError(f"Jupiter order 모든 엔드포인트 실패: {last_exc}")
 
-# ─── Jupiter Swap (재시도 + 폴백) ────────────────────────────────
-def jupiter_swap_tx(quote: dict, user_pubkey: str) -> str:
+# ─── Jupiter Ultra: 서명된 트랜잭션 실행 (RPC 직접 전송 대신 Jupiter 인프라가 처리) ──
+def jupiter_ultra_execute(signed_tx_b64: str, request_id: str) -> dict:
     last_exc = None
-    for url in JUPITER_SWAP_ENDPOINTS:
+    for url in JUPITER_EXECUTE_ENDPOINTS:
         for attempt in range(3):
             try:
                 resp = httpx.post(url, json={
-                    "quoteResponse":             quote,
-                    "userPublicKey":             user_pubkey,
-                    "wrapAndUnwrapSol":          True,
-                    "prioritizationFeeLamports": PRIORITY_FEE_MICRO,
-                    "dynamicComputeUnitLimit":   True,
-                }, headers=JUPITER_HEADERS, timeout=15)
-                logging.info(f"Jupiter swap [{url}] 응답: {resp.status_code} {resp.text[:300]}")
+                    "signedTransaction": signed_tx_b64,
+                    "requestId":         request_id,
+                }, headers=JUPITER_HEADERS, timeout=30)
+                logging.info(f"Jupiter execute [{url}] 응답: {resp.status_code} {resp.text[:300]}")
                 resp.raise_for_status()
-                return resp.json()["swapTransaction"]
+                return resp.json()
             except (httpx.ConnectError, httpx.TimeoutException) as e:
                 last_exc = e
-                logging.warning(f"Jupiter swap 실패 [{url}] ({attempt+1}/3): {e}")
+                logging.warning(f"Jupiter execute 실패 [{url}] ({attempt+1}/3): {e}")
                 time.sleep(5 * (attempt + 1))
             except httpx.HTTPStatusError as e:
                 last_exc = e
-                logging.warning(f"Jupiter swap HTTP 오류 [{url}]: {e}")
+                logging.warning(f"Jupiter execute HTTP 오류 [{url}]: {e}")
                 break
-    raise RuntimeError(f"Jupiter swap 모든 엔드포인트 실패: {last_exc}")
+    raise RuntimeError(f"Jupiter execute 모든 엔드포인트 실패: {last_exc}")
 
-# ─── 서명 및 전송 ─────────────────────────────────────────────────
-def sign_and_send(tx_b64: str, keypair: Keypair) -> tuple[str, bool]:
+# ─── 서명 (Ultra는 전송을 자체 인프라가 처리하므로 서명까지만 담당) ──
+def sign_transaction(tx_b64: str, keypair: Keypair) -> str:
     raw = base64.b64decode(tx_b64)
     tx  = VersionedTransaction.from_bytes(raw)
 
@@ -286,9 +289,24 @@ def sign_and_send(tx_b64: str, keypair: Keypair) -> tuple[str, bool]:
 
     signed     = VersionedTransaction.populate(tx.message, sigs)
     signed_b64 = base64.b64encode(bytes(signed)).decode()
-    tx_sig     = send_transaction(signed_b64)
-    ok         = confirm_transaction(tx_sig)
-    return tx_sig, ok
+    return signed_b64
+
+# ─── Ultra 주문 실행 헬퍼: order → 서명 → execute → 결과 확인 ──────
+def run_ultra_swap(input_mint: str, output_mint: str, amount_lamports: int, keypair: Keypair) -> tuple[str, bool, int]:
+    pubkey = str(keypair.pubkey())
+    order  = jupiter_ultra_order(input_mint, output_mint, amount_lamports, pubkey)
+
+    expected     = int(order.get("outAmount", 0))
+    request_id   = order["requestId"]
+    signed_tx    = sign_transaction(order["transaction"], keypair)
+    result       = jupiter_ultra_execute(signed_tx, request_id)
+
+    status = result.get("status")
+    sig    = result.get("signature")
+    ok     = (status == "Success")
+    if not ok:
+        logging.warning(f"Ultra execute 실패 상태: {status}, 상세: {result.get('error') or result}")
+    return sig, ok, expected
 
 # ─── 매수 (SOL → TOKEN) ───────────────────────────────────────────
 def buy_token(keypair: Keypair, multiplier: float = 1.0):
@@ -304,20 +322,11 @@ def buy_token(keypair: Keypair, multiplier: float = 1.0):
 
         logging.info(f"[{pubkey[:8]}] 매수 시도: {sol_amount:.4f} SOL")
 
-        before_balance = get_token_balance(pubkey, TOKEN_MINT)
+        sig, ok, expected = run_ultra_swap(WSOL_MINT, TOKEN_MINT, lamports, keypair)
 
-        quote    = jupiter_quote(WSOL_MINT, TOKEN_MINT, lamports)
-        expected = int(quote.get("outAmount", 0))
-        tx_b64   = jupiter_swap_tx(quote, pubkey)
-        sig, ok  = sign_and_send(tx_b64, keypair)
-
-        received = 0
+        received = expected if ok else 0
         if ok:
-            after_balance = get_token_balance(pubkey, TOKEN_MINT)
-            received = after_balance - before_balance
-            if received <= 0:
-                received = expected
-            logging.info(f"[{pubkey[:8]}] 매수 성공 — {received} raw token 수령")
+            logging.info(f"[{pubkey[:8]}] 매수 성공 — {received} raw token 수령(예상치)")
 
         logging.info(f"[{pubkey[:8]}] 매수 결과: {'성공' if ok else '실패'} sig={sig}")
         return sig, ok, f"{sol_amount:.4f} SOL", received
@@ -348,9 +357,7 @@ def sell_token(keypair: Keypair, received_amount: int = 0, multiplier: float = 1
             return None, False, "매도량 0"
 
         logging.info(f"[{pubkey[:8]}] 매도 시도: {amount_in} raw token")
-        quote   = jupiter_quote(TOKEN_MINT, WSOL_MINT, amount_in)
-        tx_b64  = jupiter_swap_tx(quote, pubkey)
-        sig, ok = sign_and_send(tx_b64, keypair)
+        sig, ok, _ = run_ultra_swap(TOKEN_MINT, WSOL_MINT, amount_in, keypair)
 
         readable = amount_in / (10 ** TOKEN_DECIMALS)
         logging.info(f"[{pubkey[:8]}] 매도 결과: {'성공' if ok else '실패'} sig={sig}")
@@ -567,8 +574,7 @@ async def handle_update(update_data):
                 f"TOKEN_DECIMALS: {TOKEN_DECIMALS}\n"
                 f"MIN_SOL: {MIN_SOL}\n"
                 f"MAX_SOL: {MAX_SOL}\n"
-                f"SLIPPAGE_BPS: {SLIPPAGE_BPS} ({SLIPPAGE_BPS/100:.1f}%)\n"
-                f"PRIORITY_FEE_MICRO: {PRIORITY_FEE_MICRO}\n"
+                f"슬리피지/수수료: Jupiter Ultra API 자동 관리\n"
                 f"추가 지갑 수: {len(EXTRA_WALLET_KEYS)}개\n"
                 f"거래 제외 지갑: {EXCLUDE_WALLET_INDEXES}"
             ))
@@ -625,8 +631,7 @@ async def handle_update(update_data):
                     f"✅ 자동거래 시작!\n\n"
                     f"📌 토큰: {TOKEN_MINT[:8]}...\n"
                     f"📌 거래량: {MIN_SOL}~{MAX_SOL} SOL\n"
-                    f"📌 슬리피지: {SLIPPAGE_BPS/100:.1f}%\n"
-                    f"📌 우선순위 수수료: {PRIORITY_FEE_MICRO} micro lamports\n"
+                    f"📌 슬리피지/우선순위 수수료: Jupiter Ultra API 자동 관리\n"
                     f"📌 메인: 매수2:매도1, 45~75분 간격\n"
                     f"📌 지갑1: 매수1:매도1, 100~140분(약 2시간) 간격\n"
                     f"📌 그 외 추가 지갑: 매수1:매도1, 4~6시간 간격\n"
